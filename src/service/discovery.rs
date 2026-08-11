@@ -9,7 +9,7 @@ use thiserror::Error;
 use crate::{
     Address, Master,
     operation::{DeviceIdentity, Operation, ReadDeviceIdentity, Request},
-    profile::LineProfile,
+    profile::{AddressTiming, AddressTimings, LineProfile},
     service::{ExchangeError, LinkClient, Priority, RetryPolicy},
 };
 
@@ -188,7 +188,7 @@ pub async fn discover_line(
     master: Master,
 ) -> Result<DiscoveryReport, crate::profile::ProfileError> {
     profile.validate()?;
-    Ok(discover_validated(link, profile, master, DiscoveryOptions::default()).await)
+    Ok(discover_validated(link, profile, master, DiscoveryOptions::default(), None).await)
 }
 
 /// Scans a line repeatedly with explicit priority and retry settings.
@@ -203,7 +203,32 @@ pub async fn discover_line_with_options(
     if options.pass_delay > crate::profile::MAXIMUM_PROFILE_DURATION {
         return Err(DiscoveryError::PassDelay(options.pass_delay));
     }
-    Ok(discover_validated(link, profile, master, options).await)
+    Ok(discover_validated(link, profile, master, options, None).await)
+}
+
+/// Scans a line with explicit options and timing for selected polling addresses.
+///
+/// Address keys refer to physical polling addresses after module translation.
+/// An override adds a delay before that address and can replace its response
+/// timeout without slowing every other device on the line.
+pub async fn discover_line_with_address_timings(
+    link: &LinkClient,
+    profile: &LineProfile,
+    master: Master,
+    options: DiscoveryOptions,
+    address_timings: &AddressTimings,
+) -> Result<DiscoveryReport, DiscoveryError> {
+    profile.validate()?;
+    options.retry.validate()?;
+    if options.pass_delay > crate::profile::MAXIMUM_PROFILE_DURATION {
+        return Err(DiscoveryError::PassDelay(options.pass_delay));
+    }
+    for (_, timing) in address_timings.iter() {
+        if let Some(response_timeout) = timing.response_timeout {
+            discovery_retry(options.retry, response_timeout, true).validate_runtime()?;
+        }
+    }
+    Ok(discover_validated(link, profile, master, options, Some(address_timings)).await)
 }
 
 async fn discover_validated(
@@ -211,6 +236,7 @@ async fn discover_validated(
     profile: &LineProfile,
     master: Master,
     options: DiscoveryOptions,
+    address_timings: Option<&AddressTimings>,
 ) -> DiscoveryReport {
     if !profile.timing.connect_settle.is_zero() {
         tokio::time::sleep(profile.timing.connect_settle).await;
@@ -240,6 +266,7 @@ async fn discover_validated(
                     tokio::time::sleep(profile.timing.scan_interval).await;
                 }
                 previous_probe = true;
+                let address_timing = wait_for_address_timing(address_timings, node).await;
                 let conservative = profile.discovery_preambles;
                 let hinted = (pass == 0)
                     .then(|| options.preamble_hints.get(address))
@@ -254,13 +281,12 @@ async fn discover_validated(
                         report.hinted_attempts += 1;
                     }
                     report.attempts += 1;
-                    let response_timeout = if hinted.is_some() && probe == 0 {
-                        profile.timing.steady_response
-                    } else if report.devices.is_empty() {
-                        profile.timing.first_response
-                    } else {
-                        profile.timing.steady_response
-                    };
+                    let response_timeout = discovery_response_timeout(
+                        profile,
+                        address_timing,
+                        hinted.is_some() && probe == 0,
+                        report.devices.is_empty(),
+                    );
                     let retry = discovery_retry(
                         options.retry,
                         response_timeout,
@@ -308,6 +334,34 @@ async fn discover_validated(
         }
     }
     report
+}
+
+async fn wait_for_address_timing(
+    address_timings: Option<&AddressTimings>,
+    polling_address: u8,
+) -> AddressTiming {
+    let timing = address_timings
+        .and_then(|timings| timings.get(polling_address))
+        .unwrap_or_default();
+    if !timing.delay_before_probe.is_zero() {
+        tokio::time::sleep(timing.delay_before_probe).await;
+    }
+    timing
+}
+
+fn discovery_response_timeout(
+    profile: &LineProfile,
+    address_timing: AddressTiming,
+    hinted_probe: bool,
+    no_devices_found: bool,
+) -> Duration {
+    address_timing.response_timeout.unwrap_or({
+        if hinted_probe || !no_devices_found {
+            profile.timing.steady_response
+        } else {
+            profile.timing.first_response
+        }
+    })
 }
 
 fn discovery_retry(

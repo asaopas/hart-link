@@ -1,3 +1,8 @@
+//! Software-tested host-side WirelessHART manager state.
+//!
+//! Real radio and Network Manager validation is still pending; see the parent
+//! [`crate::mesh`] module before using this model with hardware.
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use thiserror::Error;

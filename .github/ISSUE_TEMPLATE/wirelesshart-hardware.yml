@@ -1,0 +1,67 @@
+name: WirelessHART hardware report
+description: Report a reproducible difference observed with real WirelessHART hardware
+title: "WirelessHART hardware: "
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for providing real-hardware evidence. Remove every key, password,
+        private certificate, licensed specification excerpt, proprietary DeviceInfo
+        package, and unrelated production packet before uploading files.
+
+  - type: input
+    id: version
+    attributes:
+      label: HartLink version or commit
+      placeholder: "0.2.1 or a complete commit hash"
+    validations:
+      required: true
+
+  - type: input
+    id: features
+    attributes:
+      label: Enabled Cargo features
+      placeholder: "wireless-hart, runtime, ..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Hardware and software environment
+      description: Include host OS, gateway or Network Manager, device models, and firmware revisions.
+    validations:
+      required: true
+
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and actual behavior
+      description: Describe the exact operation, event order, timestamps, and whether the failure is repeatable.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproducer
+    attributes:
+      label: Minimal reproducer
+      description: Add a sanitized configuration and the smallest code or command sequence that reproduces the behavior.
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Sanitized dump or capture
+      description: Drag a raw hex dump, PCAP-NG capture, byte-exact trace, and relevant logs here. Preserve byte lengths and ordering when replacing secrets.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Sensitive-data confirmation
+      options:
+        - label: I removed all cryptographic keys, passwords, private certificates, licensed specification text, proprietary packages, and unrelated production traffic.
+          required: true

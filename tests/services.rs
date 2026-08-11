@@ -5,7 +5,9 @@ use std::time::SystemTime;
 use hart_link::{
     Address, CommandCode, DeviceReply, Master, PhysicalLayer,
     channel::{ByteChannel, ChannelFuture},
-    profile::{LineProfile, ModuleWindow, PollingWindow, TimingProfile},
+    profile::{
+        AddressTiming, AddressTimings, LineProfile, ModuleWindow, PollingWindow, TimingProfile,
+    },
     service::{BlockReceiver, BlockSender, BurstConfig, BurstHub, BurstKey, TransferBlock},
     trace::{
         ReplayChannel, ReplayLimits, ReplayStep, Trace, TraceDirection, TraceLimits, TraceRecord,
@@ -285,6 +287,73 @@ fn profile_applies_only_declared_module_shift() {
     profile.validate().unwrap();
     assert_eq!(LineProfile::shifted_address(module, 3), Some(19));
     assert_eq!(LineProfile::shifted_address(module, 16), None);
+}
+
+#[test]
+fn address_timings_are_bounded_and_validated() {
+    let timings = AddressTimings::new()
+        .with(
+            17,
+            AddressTiming::new()
+                .with_delay_before_probe(std::time::Duration::from_millis(25))
+                .with_response_timeout(std::time::Duration::from_secs(3)),
+        )
+        .unwrap();
+    assert_eq!(timings.len(), 1);
+    assert_eq!(
+        timings.get(17).unwrap().delay_before_probe,
+        std::time::Duration::from_millis(25)
+    );
+    assert!(
+        AddressTimings::new()
+            .with(64, AddressTiming::new())
+            .is_err()
+    );
+    assert!(
+        AddressTimings::new()
+            .with(
+                1,
+                AddressTiming::new().with_response_timeout(std::time::Duration::ZERO),
+            )
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn discovery_applies_delay_only_to_overridden_address() {
+    let profile = LineProfile::single_segment("address-timing", PollingWindow::new(0, 0).unwrap())
+        .with_timing(
+            TimingProfile::default()
+                .with_connect_settle(std::time::Duration::ZERO)
+                .with_first_response(std::time::Duration::from_millis(5))
+                .with_steady_response(std::time::Duration::from_millis(5))
+                .with_scan_interval(std::time::Duration::ZERO),
+        );
+    let timings = AddressTimings::new()
+        .with(
+            0,
+            AddressTiming::new()
+                .with_delay_before_probe(std::time::Duration::from_millis(20))
+                .with_response_timeout(std::time::Duration::from_millis(5)),
+        )
+        .unwrap();
+    let channel = CaptureSend::default();
+    let (client, runner) = hart_link::create_link(channel, hart_link::LinkConfig::default());
+    let task = tokio::spawn(runner.run());
+    let started = tokio::time::Instant::now();
+    let report = hart_link::service::discover_line_with_address_timings(
+        &client,
+        &profile,
+        Master::Primary,
+        hart_link::service::DiscoveryOptions::default(),
+        &timings,
+    )
+    .await
+    .unwrap();
+    assert!(report.devices.is_empty());
+    assert!(started.elapsed() >= std::time::Duration::from_millis(25));
+    drop(client);
+    task.abort();
 }
 
 #[test]

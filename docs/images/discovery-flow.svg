@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1160" height="720" viewBox="0 0 1160 720" role="img" aria-labelledby="title description">
+  <title id="title">HartLink adaptive discovery flow</title>
+  <desc id="description">Discovery applies address translation, per-address timing, preamble hints with one conservative fallback, and early completion.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#08111f"/><stop offset="1" stop-color="#17213a"/></linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%"><feDropShadow dx="0" dy="5" stdDeviation="6" flood-color="#020617" flood-opacity="0.5"/></filter>
+    <marker id="blue-arrow" markerWidth="14" markerHeight="14" refX="12" refY="5" orient="auto" markerUnits="userSpaceOnUse"><path d="M0 0 L0 10 L12 5 z" fill="#7dd3fc"/></marker>
+    <marker id="green-arrow" markerWidth="14" markerHeight="14" refX="12" refY="5" orient="auto" markerUnits="userSpaceOnUse"><path d="M0 0 L0 10 L12 5 z" fill="#34d399"/></marker>
+  </defs>
+  <rect width="1160" height="720" rx="24" fill="url(#bg)"/>
+  <text x="48" y="52" fill="#f8fafc" font-family="Inter, Segoe UI, sans-serif" font-size="27" font-weight="700">Adaptive discovery remains serialized and bounded</text>
+  <text x="48" y="80" fill="#94a3b8" font-family="Inter, Segoe UI, sans-serif" font-size="15">A hint can reduce preambles, but it never proves that a device exists.</text>
+
+  <g font-family="Inter, Segoe UI, sans-serif" text-anchor="middle" filter="url(#shadow)">
+    <g transform="translate(40 120)"><rect width="190" height="80" rx="15" fill="#172554" stroke="#60a5fa" stroke-width="2"/><text x="95" y="34" fill="#dbeafe" font-size="17" font-weight="700">Next profile address</text><text x="95" y="58" fill="#93c5fd" font-size="13">module + local address</text></g>
+    <g transform="translate(280 114)"><path d="M95 0 L190 46 L95 92 L0 46 Z" fill="#312e81" stroke="#a78bfa" stroke-width="2"/><text x="95" y="41" fill="#ede9fe" font-size="15" font-weight="700">Already identified?</text><text x="95" y="62" fill="#c4b5fd" font-size="13">previous pass</text></g>
+    <g transform="translate(330 218)"><rect width="90" height="34" rx="11" fill="#1e293b" stroke="#64748b"/><text x="45" y="22" fill="#cbd5e1" font-size="12" font-weight="700">SKIP</text></g>
+    <g transform="translate(520 120)"><rect width="190" height="80" rx="15" fill="#4c1d95" stroke="#c084fc" stroke-width="2"/><text x="95" y="34" fill="#f3e8ff" font-size="17" font-weight="700">Translate address</text><text x="95" y="58" fill="#d8b4fe" font-size="13">confirmed module shift only</text></g>
+    <g transform="translate(760 120)"><rect width="230" height="80" rx="15" fill="#713f12" stroke="#fbbf24" stroke-width="2"/><text x="115" y="34" fill="#fef3c7" font-size="17" font-weight="700">Apply address timing</text><text x="115" y="58" fill="#fde68a" font-size="13">optional delay + response timeout</text></g>
+    <g transform="translate(760 270)"><rect width="230" height="80" rx="15" fill="#164e63" stroke="#22d3ee" stroke-width="2"/><text x="115" y="34" fill="#cffafe" font-size="17" font-weight="700">Send Command 0</text><text x="115" y="58" fill="#67e8f9" font-size="13">hinted or conservative preambles</text></g>
+    <g transform="translate(500 264)"><path d="M105 0 L210 46 L105 92 L0 46 Z" fill="#312e81" stroke="#a78bfa" stroke-width="2"/><text x="105" y="41" fill="#ede9fe" font-size="15" font-weight="700">Valid identity?</text><text x="105" y="62" fill="#c4b5fd" font-size="13">checksum + correlation</text></g>
+    <g transform="translate(260 270)"><rect width="190" height="80" rx="15" fill="#064e3b" stroke="#34d399" stroke-width="2"/><text x="95" y="34" fill="#d1fae5" font-size="17" font-weight="700">Record device</text><text x="95" y="58" fill="#6ee7b7" font-size="13">identity + learned preambles</text></g>
+    <g transform="translate(30 264)"><path d="M100 0 L200 46 L100 92 L0 46 Z" fill="#134e4a" stroke="#2dd4bf" stroke-width="2"/><text x="100" y="41" fill="#ccfbf1" font-size="15" font-weight="700">All found?</text><text x="100" y="62" fill="#5eead4" font-size="13">configured addresses</text></g>
+    <g transform="translate(30 470)"><rect width="200" height="80" rx="15" fill="#064e3b" stroke="#34d399" stroke-width="2"/><text x="100" y="34" fill="#d1fae5" font-size="17" font-weight="700">Finish early</text><text x="100" y="58" fill="#6ee7b7" font-size="13">complete report</text></g>
+    <g transform="translate(300 580)"><rect width="260" height="80" rx="15" fill="#172554" stroke="#60a5fa" stroke-width="2"/><text x="130" y="34" fill="#dbeafe" font-size="17" font-weight="700">Next address or pass</text><text x="130" y="58" fill="#93c5fd" font-size="13">missing addresses only</text></g>
+    <g transform="translate(580 470)"><rect width="240" height="80" rx="15" fill="#4c1d95" stroke="#c084fc" stroke-width="2"/><text x="120" y="31" fill="#f3e8ff" font-size="17" font-weight="700">No valid reply</text><text x="120" y="53" fill="#d8b4fe" font-size="13">hint: fallback once</text><text x="120" y="70" fill="#d8b4fe" font-size="12">otherwise continue</text></g>
+  </g>
+
+  <g fill="none" stroke="#7dd3fc" stroke-width="3" marker-end="url(#blue-arrow)">
+    <path d="M230 160 H280"/>
+    <path d="M470 160 H520"/>
+    <path d="M710 160 H760"/>
+    <path d="M875 200 V270"/>
+    <path d="M760 310 H710"/>
+    <path d="M500 310 H450"/>
+    <path d="M260 310 H230"/>
+    <path d="M375 206 V218"/>
+    <path d="M605 356 V470"/>
+    <path d="M180 333 C180 430 430 450 430 580"/>
+    <path d="M580 530 C560 530 530 560 530 580"/>
+  </g>
+  <g fill="none" stroke="#34d399" stroke-width="3" marker-end="url(#green-arrow)">
+    <path d="M80 333 C80 390 130 410 130 470"/>
+    <path d="M820 510 H1040 V310 H990" stroke-dasharray="9 7"/>
+  </g>
+  <g font-family="Inter, Segoe UI, sans-serif" font-size="13" font-weight="600">
+    <text x="480" y="293" fill="#a7f3d0">yes</text>
+    <text x="480" y="148" fill="#93c5fd">no</text>
+    <text x="384" y="214" fill="#cbd5e1">yes</text>
+    <text x="618" y="410" fill="#c4b5fd">no reply</text>
+    <text x="91" y="402" fill="#a7f3d0">yes</text>
+    <text x="215" y="430" fill="#93c5fd">no</text>
+    <text x="950" y="495" fill="#a7f3d0">conservative fallback</text>
+  </g>
+</svg>

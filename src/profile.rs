@@ -12,6 +12,8 @@ pub const MAXIMUM_PROFILE_MODULES: usize = 64;
 pub const MAXIMUM_PROFILE_DURATION: Duration = Duration::from_hours(24);
 /// Largest gateway wake-up prefix retained by a profile.
 pub const MAXIMUM_PROFILE_WAKE_PREFIX: usize = 256;
+/// Largest possible number of per-address timing overrides on one HART line.
+pub const MAXIMUM_ADDRESS_TIMING_OVERRIDES: usize = 64;
 
 /// Short-address range for one discovery segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,6 +132,137 @@ impl TimingProfile {
     pub const fn with_scan_interval(mut self, duration: Duration) -> Self {
         self.scan_interval = duration;
         self
+    }
+}
+
+/// Optional discovery timing changes for one physical polling address.
+///
+/// The delay is applied before probing this address on every discovery pass.
+/// A response timeout, when present, replaces both the initial and steady
+/// line-wide response timeout only for this address.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AddressTiming {
+    /// Additional delay before transmitting Command 0 to this address.
+    pub delay_before_probe: Duration,
+    /// Address-specific response timeout, or the line-wide timeout when absent.
+    pub response_timeout: Option<Duration>,
+}
+
+impl AddressTiming {
+    /// Creates an override that initially leaves the line-wide timing unchanged.
+    pub const fn new() -> Self {
+        Self {
+            delay_before_probe: Duration::ZERO,
+            response_timeout: None,
+        }
+    }
+
+    /// Sets an additional delay before probing the address.
+    pub const fn with_delay_before_probe(mut self, delay: Duration) -> Self {
+        self.delay_before_probe = delay;
+        self
+    }
+
+    /// Replaces the response timeout for this address.
+    pub const fn with_response_timeout(mut self, timeout: Duration) -> Self {
+        self.response_timeout = Some(timeout);
+        self
+    }
+
+    fn validate(self) -> Result<(), AddressTimingError> {
+        if self
+            .response_timeout
+            .is_some_and(|timeout| timeout.is_zero())
+        {
+            return Err(AddressTimingError::ZeroTimeout);
+        }
+        for duration in [
+            self.delay_before_probe,
+            self.response_timeout.unwrap_or_default(),
+        ] {
+            if duration > MAXIMUM_PROFILE_DURATION {
+                return Err(AddressTimingError::Duration(duration));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Invalid per-address discovery timing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum AddressTimingError {
+    /// The polling address is outside the short-address range.
+    #[error("polling address {0} is outside 0..=63")]
+    PollingAddress(u8),
+    /// A configured response timeout is zero.
+    #[error("address-specific response timeout cannot be zero")]
+    ZeroTimeout,
+    /// A timing value is too large for a bounded discovery campaign.
+    #[error("address-specific duration {0:?} exceeds the supported maximum")]
+    Duration(Duration),
+}
+
+/// Validated per-address discovery timing overrides.
+///
+/// Keys are physical polling addresses after applying a module address shift.
+/// Missing addresses continue to use [`TimingProfile`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AddressTimings {
+    values: BTreeMap<u8, AddressTiming>,
+}
+
+impl AddressTimings {
+    /// Creates an empty set that does not change discovery timing.
+    pub const fn new() -> Self {
+        Self {
+            values: BTreeMap::new(),
+        }
+    }
+
+    /// Adds or replaces timing for one physical polling address.
+    pub fn insert(
+        &mut self,
+        polling_address: u8,
+        timing: AddressTiming,
+    ) -> Result<(), AddressTimingError> {
+        if usize::from(polling_address) >= MAXIMUM_ADDRESS_TIMING_OVERRIDES {
+            return Err(AddressTimingError::PollingAddress(polling_address));
+        }
+        timing.validate()?;
+        self.values.insert(polling_address, timing);
+        Ok(())
+    }
+
+    /// Adds one override and returns the updated set.
+    pub fn with(
+        mut self,
+        polling_address: u8,
+        timing: AddressTiming,
+    ) -> Result<Self, AddressTimingError> {
+        self.insert(polling_address, timing)?;
+        Ok(self)
+    }
+
+    /// Returns timing configured for one physical polling address.
+    pub fn get(&self, polling_address: u8) -> Option<AddressTiming> {
+        self.values.get(&polling_address).copied()
+    }
+
+    /// Iterates over physical polling addresses and their timing overrides.
+    pub fn iter(&self) -> impl Iterator<Item = (u8, AddressTiming)> + '_ {
+        self.values
+            .iter()
+            .map(|(&polling_address, &timing)| (polling_address, timing))
+    }
+
+    /// Returns the number of overridden polling addresses.
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    /// Reports whether line-wide timing is used for every address.
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
     }
 }
 

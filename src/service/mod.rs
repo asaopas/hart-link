@@ -17,7 +17,8 @@ pub use burst::{
 };
 pub use discovery::{
     DiscoveredDevice, DiscoveryError, DiscoveryHintError, DiscoveryHints, DiscoveryOptions,
-    DiscoveryReport, MAXIMUM_DISCOVERY_HINTS, discover_line, discover_line_with_options,
+    DiscoveryReport, MAXIMUM_DISCOVERY_HINTS, discover_line, discover_line_with_address_timings,
+    discover_line_with_options,
 };
 pub use health::{
     AdaptiveTiming, DeviceHealthConfigError, DeviceHealthOptions, DeviceHealthSnapshot,

@@ -221,7 +221,7 @@ checksum = "e34418ac499d6305c2fb5ad0ed2f6ac998c5f8ca209b4510f7f94242c647e307"
 
 [[package]]
 name = "hart-link"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64",
  "clap",

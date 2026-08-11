@@ -1,3 +1,8 @@
+//! Software-tested WirelessHART topology, route, and schedule state.
+//!
+//! Real gateway, radio, and Network Manager validation is still pending; see
+//! the parent [`crate::mesh`] module for scope and reporting guidance.
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use thiserror::Error;

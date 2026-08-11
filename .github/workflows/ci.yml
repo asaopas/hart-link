@@ -31,6 +31,15 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo +stable doc --locked --all-features --no-deps
+      - name: Check README examples
+        run: |
+          cargo +stable build --locked --all-features
+          TOKIO_RLIB="$(find target/debug/deps -name 'libtokio-*.rlib' -print -quit)"
+          test -n "$TOKIO_RLIB"
+          rustdoc +stable --test README.md --edition=2024 \
+            -L dependency=target/debug/deps \
+            --extern hart_link=target/debug/libhart_link.rlib \
+            --extern tokio="$TOKIO_RLIB"
       - name: Package
         run: cargo +stable package --locked
       - name: Build fuzz targets

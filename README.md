@@ -1,48 +1,94 @@
 # HartLink
 
-HartLink is a modular HART toolkit that separates wire representation,
-application operations, and exchange execution. Command numbers do not dictate
-the source-tree layout or the architecture of the crate.
+[![crates.io](https://img.shields.io/crates/v/hart-link.svg)](https://crates.io/crates/hart-link)
+[![docs.rs](https://docs.rs/hart-link/badge.svg)](https://docs.rs/hart-link)
+[![license](https://img.shields.io/crates/l/hart-link.svg)](https://github.com/asaopas/hart-link)
 
-## Capabilities
+HartLink is a pure-Rust toolkit for building HART masters, gateways, diagnostic
+tools, and device-management applications. It covers the path from raw wire
+bytes to typed operations and provides an asynchronous runner that safely
+serializes many callers over one physical HART line.
 
-- short and long addresses, FSK and PSK, and STX/ACK/BACK frames;
-- up to three header-extension bytes, checksum validation, and a bounded
-  streaming decoder that discards oversized input before allocating it;
-- arbitrary input fragmentation and recovery after noise or damaged frames;
-- standard and expanded logical commands in `0..=65535` through Command 31;
-- fast inspection of raw bytes, hexadecimal and Base64 input, and complete
-  request/response exchanges;
-- typed operations grouped by purpose: identification, process values, text,
-  configuration, diagnostics, and control;
-- a raw API for any vendor command and a checked API for known request sizes;
-- a cloneable queue client with a single serialized owner of the physical channel;
-- validated bounded service and normal queues, weighted fairness, cancellation,
-  and an end-to-end deadline that includes queue waiting;
-- independent limits for no-response retry, Busy retry, and delayed-response polling;
-- conservative retry safety with explicit overrides for known vendor operations;
-- optional per-device outage cooldown and bounded adaptive timing for registered
-  read-only commands;
-- coalescing of adjacent identical read-only requests without sharing failures
-  or weakening each caller's deadline;
-- local-echo removal, stale/late-response filtering, and bounded Burst routing
-  both during exchanges and while the queue is idle;
-- adaptive preamble counts learned during device identification, bounded
-  discovery hints, conservative fallback for stale hints, and early completion
-  when every configured address answers;
-- serial, transparent TCP with keepalive, byte-exact record/replay, and
-  fault-injection emulation;
-- a bounded HART-IP Version 1 session for Token-Passing PDUs, sequence
-  correlation, Publish retention, keepalive, and close;
-- exact-revision DeviceInfo-style runtime schemas, command-specific response
-  status, and bounded JSON extraction from ZIP/FDI containers;
-- a host-side WirelessHART state model for admission policy, key custody,
-  replay protection, topology, routes, and conservative schedules;
-- warning-aware typed decoding that never guesses warning semantics from a
-  broad response-code range;
-- a wire and operation core that works without the Rust standard library.
+The protocol core is `no_std`. Transport, queue, discovery, session, emulator,
+HART-IP, DeviceInfo-style schemas, and host-side WirelessHART components are
+opt-in Cargo features.
 
-## Layout
+> **Hardware status:** wired HART communication has been exercised through a
+> transparent Moxa TCP gateway and directly through a USB HART modem. The
+> `wireless-hart` feature is covered by software tests, but has not yet been
+> exercised against real WirelessHART radios and Network Managers.
+
+## Understand HartLink in one minute
+
+| If you need to... | Start with... |
+|---|---|
+| inspect or construct a HART frame without I/O | `Address`, `Request`, `Frame`, `FrameDecoder`, `inspect_bytes` |
+| read a known device over TCP or serial | `LinkBuilder`, `LinkClient`, and a typed operation |
+| share one line between many tasks | clone `LinkClient`; keep exactly one `LinkRunner` for the channel |
+| discover devices behind a gateway or module | `LineProfile` and `discover_line` |
+| send a vendor-specific command | `RawOperation` or a custom `Operation` implementation |
+| choose strict priorities or plain FIFO | `QueueScheduling` or `LinkBuilder::single_queue` |
+| test without hardware | the `emulator`, `trace`, and `verification` modules |
+| use only parsing in firmware | disable default features; the wire and operation core stays `no_std` |
+
+The central rule is simple: application code owns cloneable clients; the
+runner owns the physical stream. This prevents concurrent requests from
+interleaving bytes on a shared HART medium.
+
+![HartLink request flow](docs/images/request-flow.svg)
+
+## What is included
+
+| Layer | Supported behavior |
+|---|---|
+| Wire protocol | short and long addresses, FSK and PSK, STX/ACK/BACK, up to three header-extension bytes, checksum validation, and standard or expanded commands in `0..=65535` through Command 31 |
+| Streaming input | arbitrary fragmentation, bounded buffering, recovery after noise or damaged frames, local-echo removal, and stale/late-response filtering |
+| Operations | typed identification, process-value, text, configuration, diagnostics, and control operations; checked raw and custom vendor operations |
+| Execution | bounded queues, cancellation, coalescing of compatible reads, end-to-end deadlines, retry-safety rules, Busy retry, and delayed-response polling |
+| Discovery and sessions | module address shifts, adaptive preambles, bounded hints, per-address timing, device sessions, partial snapshots, health cooldown, and adaptive read timing |
+| Transports and labs | serial, transparent serial-over-TCP, byte-exact record/replay, PCAP-NG capture, in-memory emulation, and bounded fault injection |
+| Optional models | DeviceInfo-style schemas, bounded FDI/ZIP extraction, HART-IP Version 1 Token-Passing sessions, and software-tested host-side WirelessHART state management |
+
+HartLink preserves unknown values and raw payloads instead of inventing their
+meaning. Typed support requires a known public, licensed, or vendor-provided
+payload definition.
+
+## Hardware validation status
+
+| Path | Current evidence |
+|---|---|
+| transparent serial-over-TCP | exercised with real HART 5, 6, and 7 devices through a Moxa gateway |
+| direct wired HART | exercised with real devices through a USB HART modem |
+| emulator and fault injection | covered by automated fragmentation, noise, timeout, retry, queue, and resource-limit tests |
+| WirelessHART | software-tested host-side state only; real radio, gateway, and Network Manager validation is still pending |
+
+Hardware observations are interoperability evidence for the tested setup, not
+FieldComm certification or a guarantee for every modem and device revision.
+
+## Installation
+
+The default build provides the asynchronous runtime and transparent TCP
+transport:
+
+```toml
+[dependencies]
+hart-link = "0.2"
+```
+
+Choose only the hardware and subsystems the application actually uses:
+
+```toml
+# Parser, encoder, inspector, operations, and common tables; no std or Tokio.
+hart-link = { version = "0.2", default-features = false }
+
+# Runtime with both transparent TCP and serial transports.
+hart-link = { version = "0.2", features = ["serial"] }
+
+# Every optional subsystem, useful for a desktop laboratory tool.
+hart-link = { version = "0.2", features = ["full"] }
+```
+
+## Architecture
 
 ```text
 src/
@@ -54,7 +100,7 @@ src/
 ├── channel/       independent TCP and serial byte channels
 ├── device/        dynamic schemas for specific devices
 ├── ip.rs          HART-IP packet session
-├── mesh/          host-side WirelessHART mechanisms
+├── mesh/          software-tested host-side WirelessHART mechanisms
 ├── emulator.rs    in-memory link, device, noise, and failures
 ├── trace.rs       recording, PCAP-NG, and deterministic replay
 └── profile.rs     link, module, address-offset, and timing settings
@@ -64,7 +110,9 @@ The wire layer does not depend on typed operations. Operations do not depend on
 Tokio, TCP, or serial ports. Only `LinkRunner` owns the physical channel, while
 `LinkClient` can be cloned for independent application components.
 
-## Cargo features
+![HartLink module architecture](docs/images/architecture.svg)
+
+## Feature selection
 
 | Feature | Purpose |
 |---|---|
@@ -75,18 +123,25 @@ Tokio, TCP, or serial ports. Only `LinkRunner` owns the physical channel, while
 | `device-info` | dynamic schemas and JSON catalog |
 | `fdi-package` | bounded loading of matching JSON profiles from ZIP/FDI containers |
 | `hart-ip` | HART-IP Version 1 packet session and Token-Passing adapter |
-| `wireless-hart` | host-side admission state, key custody, replay window, graph, route, and schedule |
+| `wireless-hart` | experimental host-side admission, key custody, replay protection, graph, routes, and schedules; real hardware validation pending |
 | `emulator` | in-memory link, device, and fault injection |
 | `cli` | local frame inspector and request builder |
 | `full` | every library subsystem |
 
-The default feature set enables `runtime` and `tcp`. Check the minimal core with:
+Features are additive. The default set is `runtime + tcp`; enabling `serial`
+does not disable TCP. The `full` feature is convenient for tools and labs, but
+libraries should normally enable only the required pieces.
+
+Check the minimal core with:
 
 ```text
 cargo check --no-default-features
 ```
 
-## Wire-level example
+## Quick start: inspect a frame without hardware
+
+This path needs no runtime, socket, or serial port. It is suitable for packet
+inspectors, capture analysis, and embedded applications:
 
 ```rust
 use hart_link::{Address, Master, Request, inspect_bytes};
@@ -100,7 +155,10 @@ assert_eq!(report.command.get(), 0);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-## Queue example
+## Quick start: read a device through transparent TCP
+
+Create the channel once, start one runner, and clone the client wherever the
+application needs access to the line:
 
 ```rust,no_run
 use std::time::Duration;
@@ -130,14 +188,70 @@ println!("type: {}, id: {:06X}", identity.device_type, identity.device_id);
 # }
 ```
 
-## Queue scheduling presets
+To scan a known polling range instead of addressing one known device, reuse the
+same client and describe the physical line explicitly:
+
+```rust,no_run
+use hart_link::Master;
+use hart_link::profile::{LineProfile, PollingWindow};
+use hart_link::service::discover_line;
+# use hart_link::LinkClient;
+
+# async fn scan(client: &LinkClient) -> Result<(), Box<dyn std::error::Error>> {
+let profile = LineProfile::single_segment(
+    "line-1",
+    PollingWindow::new(0, 15)?,
+)
+.with_discovery_preambles(20);
+
+let report = discover_line(client, &profile, Master::Primary).await?;
+for device in report.devices {
+    println!(
+        "address={:?}, HART={}, type={}, id={:06X}",
+        device.address,
+        device.identity.universal_revision,
+        device.identity.device_type,
+        device.identity.device_id,
+    );
+}
+# Ok(())
+# }
+```
+
+An `execute` call covers the complete lifecycle below. Its total deadline starts
+before enqueueing, so time spent waiting behind other commands is never hidden.
+
+![HartLink exchange lifecycle](docs/images/exchange-lifecycle.svg)
+
+## Queue modes and scheduling
+
+HartLink has two explicit queue models. Select the simplest one that matches
+the application:
+
+| Mode | Ordering | Best fit |
+|---|---|---|
+| prioritized queues | weighted service/normal scheduling | interactive tools, shared gateways, and systems with latency classes |
+| one global queue | strict bounded FIFO; supplied priorities are ignored | one producer, simple polling loops, and applications that do not need priority |
+
+In prioritized mode the request first receives its effective queue, is then
+checked by `CommandPolicy`, and only then consumes queue capacity:
+
+![HartLink prioritized queues](docs/images/priority-queues.svg)
 
 Queue scheduling changes latency distribution, not physical HART throughput.
-When both queues remain populated, `QueueScheduling::EQUAL` alternates one
-service and one normal request. `QueueScheduling::MAXIMUM_SERVICE` permits up
-to 255 service requests before one normal request; it is bounded to retain a
-starvation-free guarantee but can still exhaust a normal request's deadline.
-A custom `N:1` ratio is validated explicitly:
+If either queue is empty, the other proceeds immediately without artificial
+pauses.
+
+| Preset | Service : normal | Meaning |
+|---|---:|---|
+| `QueueScheduling::EQUAL` | `1:1` | alternate while both queues have work |
+| default | `3:1` | favor service traffic without starving normal work |
+| `QueueScheduling::MAXIMUM_SERVICE` | `255:1` | strongest bounded service preference |
+| `QueueScheduling::custom(n)` | `n:1` | validated application-specific ratio |
+
+`MAXIMUM_SERVICE` remains starvation-free, but a normal request can still use
+up its own deadline while waiting behind a sustained service load. A custom
+ratio is validated explicitly:
 
 ```rust,no_run
 use hart_link::{LinkBuilder, QueueScheduling};
@@ -152,15 +266,16 @@ let (_client, _runner) = LinkBuilder::new(channel)
 # }
 ```
 
-The default remains `3:1`. If one queue is empty, the other proceeds without
-artificial pauses. Existing `with_service_weight` and `service_weight` methods
-remain available for compatibility.
+Existing `with_service_weight` and `service_weight` methods remain available
+for compatibility.
 
 ## One queue, routing, and command admission
 
 Applications that do not need priorities can select one bounded global FIFO.
 In this mode every caller shares the same ordering and supplied priorities are
 ignored:
+
+![HartLink single queue mode](docs/images/single-queue.svg)
 
 ```rust,no_run
 use hart_link::LinkBuilder;
@@ -226,7 +341,7 @@ their caller-selected behavior.
 ```rust,no_run
 use std::{num::NonZeroU8, time::Duration};
 use hart_link::{AdaptiveTiming, DeviceHealthOptions};
-# use hart_link::DeviceSession;
+# use hart_link::service::DeviceSession;
 # fn example(session: DeviceSession) -> Result<(), Box<dyn std::error::Error>> {
 let options = DeviceHealthOptions::default()
     .with_failure_threshold(NonZeroU8::new(3).unwrap())
@@ -253,7 +368,7 @@ groups can be disabled with `SnapshotOptions`, including an identity-only
 snapshot that performs no I/O.
 
 ```rust,no_run
-use hart_link::{DeviceSession, SnapshotOptions};
+use hart_link::{SnapshotOptions, service::DeviceSession};
 # async fn example(session: &DeviceSession) {
 let snapshot = session.snapshot(SnapshotOptions::FULL).await;
 if let Some(primary) = snapshot.primary_value.value() {
@@ -335,6 +450,28 @@ is clearer.
 
 ## Safe adaptive discovery
 
+Selected physical polling addresses can receive an additional pre-probe delay
+and their own response timeout without slowing every other address. Overrides
+use the address after applying a confirmed module shift:
+
+![HartLink adaptive discovery](docs/images/discovery-flow.svg)
+
+```rust,no_run
+use std::time::Duration;
+use hart_link::profile::{AddressTiming, AddressTimings};
+
+let timings = AddressTimings::new().with(
+    17,
+    AddressTiming::new()
+        .with_delay_before_probe(Duration::from_millis(500))
+        .with_response_timeout(Duration::from_secs(8)),
+)?;
+# Ok::<(), hart_link::profile::AddressTimingError>(())
+```
+
+Pass this set to `discover_line_with_address_timings`; ordinary
+`discover_line` and `discover_line_with_options` retain the line-wide timing.
+
 `discover_line_with_options` scans each configured address sequentially and
 skips addresses already identified on an earlier pass. A complete pass exits
 immediately when every configured address answered, so extra passes do not add
@@ -352,6 +489,38 @@ Discovery remains serialized because a HART physical link is a shared medium.
 Running address probes in parallel would make frames collide and is not a safe
 performance optimization.
 
+## WirelessHART hardware feedback
+
+The `wireless-hart` feature has automated coverage for admission decisions,
+key erasure, replay protection, topology, routes, schedules, and resource
+limits. It has not yet been validated against a broad matrix of real radios,
+gateways, Network Managers, and device firmware. HartLink therefore does not
+claim complete over-the-air interoperability or FieldComm conformance.
+
+This limitation applies specifically to WirelessHART. The ordinary wired HART
+path has already been exercised through a transparent Moxa TCP gateway and a
+direct USB HART modem.
+
+If real hardware behaves differently, open a
+[WirelessHART hardware report](https://github.com/asaopas/hart-link/issues/new?template=wirelesshart-hardware.yml).
+A useful report contains:
+
+- the HartLink version or commit and enabled Cargo features;
+- host OS, gateway or Network Manager model, device model, and firmware
+  revisions;
+- the exact operation, expected result, actual result, and whether the failure
+  is repeatable;
+- monotonic timestamps and the event order leading to the failure;
+- a minimal sanitized configuration plus logs;
+- the smallest raw hexadecimal dump, PCAP-NG capture, or byte-exact trace that
+  reproduces the behavior.
+
+Do **not** publish join keys, network or session keys, passwords, private
+certificates, licensed specification text, proprietary DeviceInfo packages, or
+unrelated production traffic. Replace secrets with fixed placeholders while
+preserving byte lengths and message ordering. Hardware reports are used to add
+a regression case first and then adjust the implementation without guessing.
+
 ## Boundaries
 
 The built-in catalog does not replace licensed Common Tables, Command Summary,
@@ -364,13 +533,13 @@ source.
 The HART-IP feature implements the publicly documented Version 1 stream session
 and Token-Passing PDU path, including TCP. It does not claim UDP session-port
 handling, Direct PDU, later protocol-version security, or official HART-IP
-conformance. The WirelessHART feature is host-side
-state machinery, not a radio stack, cryptographic join implementation, or a
-complete Network Manager. The host-side manager exposes no unauthenticated join
-shortcut: applications must provide a verifier, keys are redacted and zeroized,
-and replacing a key invalidates active state. The block helper enforces bounded
-ordering but does not claim the complete licensed Block Transfer 2.0 command
-state machine.
+conformance. The WirelessHART feature is software-tested host-side state
+machinery, not a hardware-validated radio stack, cryptographic join
+implementation, or complete Network Manager. The host-side manager exposes no
+unauthenticated join shortcut: applications must provide a verifier, keys are
+redacted and zeroized, and replacing a key invalidates active state. The block
+helper enforces bounded ordering but does not claim the complete licensed Block
+Transfer 2.0 command state machine.
 
 HART 7.10 introduced specification revisions and Command 554. HartLink can
 carry Command 554 through the raw expanded-command API, but a typed codec must

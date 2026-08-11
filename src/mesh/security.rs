@@ -1,3 +1,8 @@
+//! Software-tested WirelessHART key custody and replay state.
+//!
+//! This module is not a hardware-validated cryptographic radio implementation;
+//! see the parent [`crate::mesh`] module for scope and reporting guidance.
+
 use thiserror::Error;
 use zeroize::Zeroize;
 

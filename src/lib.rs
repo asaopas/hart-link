@@ -5,6 +5,14 @@
 //! without the standard library. The asynchronous queue and network channels
 //! are enabled by the `runtime` feature.
 //!
+//! # Hardware validation status
+//!
+//! Wired HART communication has been exercised with real devices through a
+//! transparent Moxa TCP gateway and directly through a USB HART modem. The
+//! `wireless-hart` feature is covered by software tests but has not yet been
+//! exercised against real WirelessHART radios and Network Managers. See the
+//! `mesh` module for the reporting format and safety requirements for dumps.
+//!
 //! # Minimal wire example
 //!
 //! ```
@@ -46,7 +54,7 @@ pub mod emulator;
 /// HART-IP packet transport.
 #[cfg(feature = "hart-ip")]
 pub mod ip;
-/// Host-side WirelessHART mechanisms.
+/// Software-tested host-side WirelessHART mechanisms; real hardware validation is pending.
 #[cfg(feature = "wireless-hart")]
 pub mod mesh;
 /// Bounded DeviceInfo extraction from an FDI package.
