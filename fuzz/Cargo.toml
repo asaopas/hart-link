@@ -1,0 +1,29 @@
+[package]
+name = "hart-link-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+hart-link = { path = "..", default-features = false, features = ["fdi-package", "hart-ip"] }
+
+[[bin]]
+name = "wire_stream"
+path = "fuzz_targets/wire_stream.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "structured_inputs"
+path = "fuzz_targets/structured_inputs.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

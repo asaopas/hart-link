@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt --target thumbv7em-none-eabihf
+      - name: Format
+        run: cargo +stable fmt --check
+      - name: Clippy
+        run: cargo +stable clippy --locked --all-features --all-targets -- -D warnings
+      - name: Test every feature
+        run: cargo +stable test --locked --all-features
+      - name: Test no_std core
+        run: cargo +stable test --locked --no-default-features
+      - name: Check no_std core on bare metal
+        run: cargo +stable check --locked --no-default-features --target thumbv7em-none-eabihf
+      - name: Rustdoc
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo +stable doc --locked --all-features --no-deps
+      - name: Package
+        run: cargo +stable package --locked
+      - name: Build fuzz targets
+        run: cargo +stable check --manifest-path fuzz/Cargo.toml --locked
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install MSRV
+        run: rustup toolchain install 1.91.0 --profile minimal --target thumbv7em-none-eabihf
+      - name: Check MSRV
+        run: cargo +1.91.0 check --locked --all-features
+      - name: Check no_std MSRV on bare metal
+        run: cargo +1.91.0 check --locked --no-default-features --target thumbv7em-none-eabihf
+
+  platform:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+        rust: [stable, 1.91.0]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust
+        run: rustup toolchain install ${{ matrix.rust }} --profile minimal
+      - name: Test all features
+        run: cargo +${{ matrix.rust }} test --locked --all-features
+
+  feature:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        feature:
+          - device-info
+          - fdi-package
+          - runtime
+          - tcp
+          - serial
+          - hart-ip
+          - wireless-hart
+          - emulator
+          - cli
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Check independent feature
+        run: cargo +stable check --locked --no-default-features --features "${{ matrix.feature }}"
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.22.2 --locked
+      - name: Audit locked dependencies
+        run: cargo audit --file Cargo.lock
+      - name: Audit fuzz dependencies
+        run: cargo audit --file fuzz/Cargo.lock

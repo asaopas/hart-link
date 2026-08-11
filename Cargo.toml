@@ -1,0 +1,60 @@
+[package]
+name = "hart-link"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.91.0"
+description = "HART tools for embedded and asynchronous applications"
+readme = "README.md"
+repository = "https://github.com/asaopas/hart-link"
+homepage = "https://github.com/asaopas/hart-link"
+documentation = "https://docs.rs/hart-link"
+license = "MIT OR Apache-2.0"
+keywords = ["hart", "fieldbus", "industrial", "no-std"]
+categories = ["embedded", "network-programming", "parser-implementations"]
+exclude = [".idea/**", "target/**", "**/.DS_Store"]
+
+[dependencies]
+base64 = { version = "0.22.1", default-features = false, features = ["alloc"] }
+clap = { version = "4.5", features = ["derive"], optional = true }
+serde = { version = "1.0", default-features = false, features = ["alloc", "derive"], optional = true }
+serde_json = { version = "1.0", optional = true }
+socket2 = { version = "0.6", optional = true }
+thiserror = { version = "2.0", default-features = false }
+tokio = { version = "1.44", features = ["io-util", "macros", "net", "rt", "sync", "time"], optional = true }
+tokio-serial = { version = "5.5", optional = true }
+zeroize = { version = "1.8", default-features = false, optional = true }
+zip = { version = "4.6", default-features = false, features = ["deflate"], optional = true }
+
+[features]
+default = ["runtime", "tcp"]
+std = ["base64/std", "thiserror/std"]
+runtime = ["std", "dep:tokio"]
+tcp = ["runtime", "dep:socket2"]
+serial = ["runtime", "dep:tokio-serial"]
+device-info = ["std", "dep:serde", "dep:serde_json"]
+fdi-package = ["device-info", "dep:zip"]
+hart-ip = ["runtime"]
+wireless-hart = ["std", "dep:zeroize"]
+emulator = ["runtime"]
+cli = ["runtime", "tcp", "serial", "device-info", "dep:clap", "tokio/rt-multi-thread"]
+full = ["tcp", "serial", "device-info", "fdi-package", "hart-ip", "wireless-hart", "emulator"]
+
+[[bin]]
+name = "hart-link"
+path = "src/bin/hart-link.rs"
+required-features = ["cli"]
+
+[dev-dependencies]
+tokio = { version = "1.44", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "test-util", "time"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+doc_markdown = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+return_self_not_must_use = "allow"
