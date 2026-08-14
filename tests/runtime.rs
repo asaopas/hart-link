@@ -181,6 +181,94 @@ impl hart_link::channel::ByteChannel for SilentChannel {
     }
 }
 
+#[derive(Debug)]
+struct GatedSchedulerChannel {
+    address: Address,
+    pending: std::collections::VecDeque<u8>,
+    commands: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    first_response_gate: std::sync::Arc<tokio::sync::Notify>,
+    gate_first_response: bool,
+}
+
+impl GatedSchedulerChannel {
+    fn new(
+        address: Address,
+    ) -> (
+        Self,
+        std::sync::Arc<tokio::sync::Notify>,
+        std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    ) {
+        let first_response_gate = std::sync::Arc::new(tokio::sync::Notify::new());
+        let commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        (
+            Self {
+                address,
+                pending: std::collections::VecDeque::new(),
+                commands: commands.clone(),
+                first_response_gate: first_response_gate.clone(),
+                gate_first_response: true,
+            },
+            first_response_gate,
+            commands,
+        )
+    }
+}
+
+impl hart_link::channel::ByteChannel for GatedSchedulerChannel {
+    fn send<'a>(&'a mut self, bytes: &'a [u8]) -> hart_link::channel::ChannelFuture<'a, ()> {
+        Box::pin(async move {
+            let start = bytes
+                .iter()
+                .position(|byte| *byte != 0xff)
+                .expect("request contains a delimiter");
+            let delimiter = bytes[start];
+            let address_len = if delimiter & 0x80 == 0 { 1 } else { 5 };
+            let expansion_len = usize::from((delimiter >> 5) & 0x03);
+            let command = bytes[start + 1 + address_len + expansion_len];
+            self.commands.lock().unwrap().push(command);
+            self.pending.extend(
+                Frame {
+                    preambles: 5,
+                    kind: FrameKind::Response,
+                    physical_layer: PhysicalLayer::Fsk,
+                    address: self.address,
+                    expansion: Vec::new(),
+                    wire_command: command,
+                    payload: vec![0, 0],
+                    repair: None,
+                }
+                .encode()
+                .unwrap(),
+            );
+            Ok(())
+        })
+    }
+
+    fn receive<'a>(
+        &'a mut self,
+        buffer: &'a mut [u8],
+    ) -> hart_link::channel::ChannelFuture<'a, usize> {
+        Box::pin(async move {
+            if self.gate_first_response {
+                self.gate_first_response = false;
+                self.first_response_gate.notified().await;
+            }
+            if self.pending.is_empty() {
+                return std::future::pending().await;
+            }
+            let count = buffer.len().min(self.pending.len());
+            for destination in &mut buffer[..count] {
+                *destination = self.pending.pop_front().unwrap_or_default();
+            }
+            Ok(count)
+        })
+    }
+
+    fn flush(&mut self) -> hart_link::channel::ChannelFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
 #[tokio::test]
 async fn runner_handles_echo_noise_fragments_and_many_clients() {
     let address = Address::polling(3, Master::Primary).unwrap();
@@ -1030,6 +1118,64 @@ async fn service_weight_prevents_normal_queue_starvation() {
     runner_task.await.unwrap();
 }
 
+#[tokio::test]
+async fn service_weight_changes_atomically_after_the_current_exchange() {
+    let address = Address::polling(1, Master::Primary).unwrap();
+    let (channel, first_response_gate, commands) = GatedSchedulerChannel::new(address);
+    let scheduling = hart_link::QueueScheduling::custom(3).unwrap();
+    let (client, runner) = LinkBuilder::new(channel)
+        .queue_scheduling(scheduling)
+        .build()
+        .unwrap();
+    let mut events = client.subscribe();
+    let mut pending = Vec::new();
+    for command in 10_u8..=12 {
+        pending.push(
+            client
+                .start(
+                    Request::new(address, command, vec![]),
+                    Priority::Service,
+                    RetryPolicy::default(),
+                )
+                .await
+                .unwrap(),
+        );
+    }
+    for command in 20_u8..=21 {
+        pending.push(
+            client
+                .start(
+                    Request::new(address, command, vec![]),
+                    Priority::Normal,
+                    RetryPolicy::default(),
+                )
+                .await
+                .unwrap(),
+        );
+    }
+
+    let runner_task = tokio::spawn(runner.run());
+    loop {
+        if matches!(events.recv().await, Ok(LinkEvent::Started { .. })) {
+            break;
+        }
+    }
+    assert_eq!(client.service_weight(), 3);
+    client.set_service_weight(1).unwrap();
+    assert_eq!(client.service_weight(), 1);
+    assert!(client.set_service_weight(0).is_err());
+    assert_eq!(client.service_weight(), 1);
+
+    first_response_gate.notify_one();
+    for reply in pending {
+        reply.wait().await.unwrap();
+    }
+    assert_eq!(&*commands.lock().unwrap(), &[10, 20, 11, 21, 12]);
+
+    drop(client);
+    runner_task.await.unwrap();
+}
+
 #[test]
 fn queue_scheduling_presets_are_valid_and_explicit() {
     assert_eq!(hart_link::QueueScheduling::EQUAL.service_weight(), 1);
@@ -1048,6 +1194,24 @@ fn queue_scheduling_presets_are_valid_and_explicit() {
     let config =
         hart_link::LinkConfig::default().with_queue_scheduling(hart_link::QueueScheduling::EQUAL);
     assert_eq!(config.service_weight, 1);
+}
+
+#[test]
+fn concurrent_service_weight_updates_are_atomic() {
+    let (channel, _device) = MemoryChannel::try_pair(8).unwrap();
+    let (client, _runner) = LinkBuilder::new(channel).build().unwrap();
+    let mut workers = Vec::new();
+    for weight in 4_u8..=11 {
+        let client = client.clone();
+        workers.push(std::thread::spawn(move || {
+            client.set_service_weight(weight).unwrap();
+        }));
+    }
+    for worker in workers {
+        worker.join().unwrap();
+    }
+
+    assert!((4..=11).contains(&client.service_weight()));
 }
 
 #[test]

@@ -4,7 +4,7 @@ use std::{
     num::NonZeroU8,
     sync::{
         Arc,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -256,8 +256,8 @@ impl CommandRouting {
 
 /// Starvation-free scheduling preset for the two link queues.
 ///
-/// The value is converted to the existing service quota when the link is built,
-/// so selecting a preset adds no work to the exchange path.
+/// The selected value becomes the initial atomic service quota and can later be
+/// replaced through [`LinkClient::set_queue_scheduling`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueueScheduling {
     service_weight: NonZeroU8,
@@ -298,6 +298,28 @@ impl QueueScheduling {
 impl Default for QueueScheduling {
     fn default() -> Self {
         Self::custom(3).unwrap_or(Self::EQUAL)
+    }
+}
+
+#[derive(Debug)]
+struct QueueSchedulerControl {
+    service_weight: AtomicU8,
+}
+
+impl QueueSchedulerControl {
+    const fn new(service_weight: u8) -> Self {
+        Self {
+            service_weight: AtomicU8::new(service_weight),
+        }
+    }
+
+    fn service_weight(&self) -> u8 {
+        self.service_weight.load(Ordering::Acquire)
+    }
+
+    fn set_service_weight(&self, service_weight: NonZeroU8) {
+        self.service_weight
+            .store(service_weight.get(), Ordering::Release);
     }
 }
 
@@ -906,9 +928,30 @@ pub struct LinkClient {
     queue_mode: QueueMode,
     command_policy: CommandPolicy,
     command_routing: CommandRouting,
+    scheduler: Arc<QueueSchedulerControl>,
 }
 
 impl LinkClient {
+    /// Returns the currently active `service:normal` ratio as `N:1`.
+    pub fn service_weight(&self) -> u8 {
+        self.scheduler.service_weight()
+    }
+
+    /// Changes the service quota atomically without reconnecting the channel.
+    ///
+    /// An in-flight exchange is never interrupted. The new value is observed at
+    /// the next queue selection, and normal work remains starvation-free.
+    pub fn set_service_weight(&self, service_weight: u8) -> Result<(), QueueSchedulingError> {
+        let scheduling = QueueScheduling::custom(service_weight)?;
+        self.set_queue_scheduling(scheduling);
+        Ok(())
+    }
+
+    /// Applies a validated scheduling preset atomically.
+    pub fn set_queue_scheduling(&self, scheduling: QueueScheduling) {
+        self.scheduler.set_service_weight(scheduling.service_weight);
+    }
+
     /// Returns the priority selected for convenience operations.
     pub const fn default_priority(&self) -> Priority {
         self.default_priority
@@ -1325,7 +1368,7 @@ pub struct LinkRunner<C> {
     events: broadcast::Sender<LinkEvent>,
     counters: Arc<Counters>,
     decoder: FrameDecoder,
-    service_weight: u8,
+    scheduler: Arc<QueueSchedulerControl>,
     read_buffer: Vec<u8>,
     burst_hub: Option<BurstHub>,
     channel_usable: bool,
@@ -1586,6 +1629,7 @@ fn build_link<C: ByteChannel>(
     let (normal_tx, normal_rx) = mpsc::channel(config.normal_capacity);
     let (events, _) = broadcast::channel(options.event_capacity);
     let counters = Arc::new(Counters::default());
+    let scheduler = Arc::new(QueueSchedulerControl::new(config.service_weight));
     let client = LinkClient {
         service_tx,
         normal_tx,
@@ -1596,6 +1640,7 @@ fn build_link<C: ByteChannel>(
         queue_mode: options.queue_mode,
         command_policy: options.command_policy,
         command_routing: options.command_routing,
+        scheduler: scheduler.clone(),
     };
     let runner = LinkRunner {
         channel,
@@ -1604,7 +1649,7 @@ fn build_link<C: ByteChannel>(
         events,
         counters,
         decoder: FrameDecoder::new(config.decoder),
-        service_weight: config.service_weight,
+        scheduler,
         read_buffer: vec![0; config.read_buffer_size],
         burst_hub: None,
         channel_usable: true,
@@ -1625,8 +1670,8 @@ impl<C: ByteChannel> LinkRunner<C> {
 
     /// Serves the queue until every client is closed.
     pub async fn run(mut self) {
-        let mut service_budget = self.service_weight;
-        while let Some((priority, mut job)) = self.next_job(&mut service_budget).await {
+        let mut consecutive_service = 0_u16;
+        while let Some((priority, mut job)) = self.next_job(&mut consecutive_service).await {
             self.decrement_queue(priority);
             if job.reply.as_ref().is_none_or(oneshot::Sender::is_closed) {
                 self.mark_cancelled(job.id);
@@ -1678,21 +1723,20 @@ impl<C: ByteChannel> LinkRunner<C> {
         self.fail_pending_jobs();
     }
 
-    async fn next_job(&mut self, budget: &mut u8) -> Option<(Priority, Job)> {
+    async fn next_job(&mut self, consecutive_service: &mut u16) -> Option<(Priority, Job)> {
         loop {
-            if *budget == 0 {
-                if let Some(job) = self.try_take_job(Priority::Normal) {
-                    *budget = self.service_weight;
-                    return Some((Priority::Normal, job));
-                }
-                *budget = self.service_weight;
+            let service_weight = u16::from(self.scheduler.service_weight());
+            let normal_is_due = *consecutive_service >= service_weight;
+            if normal_is_due && let Some(job) = self.try_take_job(Priority::Normal) {
+                *consecutive_service = 0;
+                return Some((Priority::Normal, job));
             }
             if let Some(job) = self.try_take_job(Priority::Service) {
-                *budget = budget.saturating_sub(1);
+                *consecutive_service = consecutive_service.saturating_add(1);
                 return Some((Priority::Service, job));
             }
             if let Some(job) = self.try_take_job(Priority::Normal) {
-                *budget = self.service_weight;
+                *consecutive_service = 0;
                 return Some((Priority::Normal, job));
             }
             if self.service_rx.is_closed() && self.normal_rx.is_closed() {
@@ -1705,7 +1749,7 @@ impl<C: ByteChannel> LinkRunner<C> {
                 };
                 match selected {
                     Some(IdleSelection::Job(priority, job)) => {
-                        *budget = self.service_weight;
+                        *consecutive_service = 0;
                         return Some((priority, job));
                     }
                     Some(IdleSelection::Input(result)) => {
@@ -1724,7 +1768,7 @@ impl<C: ByteChannel> LinkRunner<C> {
                 };
                 match selected {
                     Some(IdleSelection::Job(priority, job)) => {
-                        *budget = budget.saturating_sub(1);
+                        *consecutive_service = consecutive_service.saturating_add(1);
                         return Some((priority, job));
                     }
                     Some(IdleSelection::Input(result)) => {
@@ -1736,7 +1780,7 @@ impl<C: ByteChannel> LinkRunner<C> {
                     None => return None,
                 }
             }
-            let selected = if *budget == 0 {
+            let selected = if normal_is_due {
                 tokio::select! {
                     biased;
                     value = self.normal_rx.recv() => value.map(|job| IdleSelection::Job(Priority::Normal, job)),
@@ -1754,8 +1798,10 @@ impl<C: ByteChannel> LinkRunner<C> {
             match selected {
                 Some(IdleSelection::Job(priority, job)) => {
                     match priority {
-                        Priority::Service => *budget = budget.saturating_sub(1),
-                        Priority::Normal => *budget = self.service_weight,
+                        Priority::Service => {
+                            *consecutive_service = consecutive_service.saturating_add(1);
+                        }
+                        Priority::Normal => *consecutive_service = 0,
                     }
                     return Some((priority, job));
                 }

@@ -269,6 +269,29 @@ let (_client, _runner) = LinkBuilder::new(channel)
 Existing `with_service_weight` and `service_weight` methods remain available
 for compatibility.
 
+### Changing queue weights
+
+The `service:normal` ratio can be changed while the link is running:
+
+```rust,no_run
+# use hart_link::{LinkBuilder, QueueScheduling};
+# use hart_link::emulator::MemoryChannel;
+# fn example() -> Result<(), Box<dyn std::error::Error>> {
+# let (channel, _) = MemoryChannel::try_pair(8)?;
+let (link, _runner) = LinkBuilder::new(channel)
+    .queue_scheduling(QueueScheduling::custom(3)?)
+    .build()?;
+
+let ddngine = link.service();
+let instrument_inspector = link.normal();
+
+link.set_service_weight(5)?; // Service:Normal = 5:1
+assert_eq!(link.service_weight(), 5);
+# let _ = (ddngine, instrument_inspector);
+# Ok(())
+# }
+```
+
 ## One queue, routing, and command admission
 
 Applications that do not need priorities can select one bounded global FIFO.
