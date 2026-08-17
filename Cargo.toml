@@ -23,7 +23,7 @@ thiserror = { version = "2.0", default-features = false }
 tokio = { version = "1.44", features = ["io-util", "macros", "net", "rt", "sync", "time"], optional = true }
 tokio-serial = { version = "5.5", optional = true }
 zeroize = { version = "1.8", default-features = false, optional = true }
-zip = { version = "4.6", default-features = false, features = ["deflate"], optional = true }
+zip = { version = "8.6", default-features = false, features = ["deflate"], optional = true }
 
 [features]
 default = ["runtime", "tcp"]
