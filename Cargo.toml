@@ -1,6 +1,6 @@
 [package]
 name = "hart-link"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.91.0"
 description = "HART tools for embedded and asynchronous applications"

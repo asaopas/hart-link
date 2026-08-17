@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use crate::{
     Request,
-    service::{ExchangeError, LinkClient, Priority, RetryPolicy},
+    service::{ExchangeError, LinkClient, RetryPolicy},
 };
 
 /// Expected result of one functional case.
@@ -62,7 +62,7 @@ pub async fn run_campaign(link: &LinkClient, cases: &[VerificationCase]) -> Veri
     for case in cases {
         let started = Instant::now();
         let result = link
-            .request(case.request.clone(), Priority::Normal, case.retry)
+            .request(case.request.clone(), link.default_queue_id(), case.retry)
             .await;
         let elapsed = started.elapsed();
         let (passed, error) = match result {

@@ -12,11 +12,15 @@ use hart_link::{
     service::{
         AdaptiveTiming, DeviceHealthOptions, DeviceSession, DiscoveryHints, DiscoveryOptions,
         LinkBuilder, LinkEvent, ManagedDeviceSession, ManagedSessionError, Plan, PlanExpectation,
-        PlanStep, Priority, RetryPolicy, SnapshotField, SnapshotOptions, discover_line,
+        PlanStep, QueueId, RetryPolicy, SnapshotField, SnapshotOptions, discover_line,
         discover_line_with_options,
     },
     trace::{ReplayChannel, ReplayStep},
 };
+
+const FAST_QUEUE: QueueId = QueueId::new(10);
+const REGULAR_QUEUE: QueueId = QueueId::new(20);
+const STRICT_QUEUE: QueueId = QueueId::new(30);
 
 fn test_device(address: Address) -> EmulatedDevice {
     EmulatedDevice {
@@ -300,7 +304,7 @@ async fn runner_handles_echo_noise_fragments_and_many_clients() {
         Address::unique(0x042a, 0x12_34_56, Master::Primary).unwrap()
     );
     let session_value = session
-        .execute(&ReadPrimaryValue, Priority::Normal, RetryPolicy::default())
+        .execute(&ReadPrimaryValue, QueueId::DEFAULT, RetryPolicy::default())
         .await
         .unwrap();
     assert!((session_value.value - 123.5).abs() < f32::EPSILON);
@@ -314,7 +318,7 @@ async fn runner_handles_echo_noise_fragments_and_many_clients() {
                     .execute(
                         address,
                         &ReadPrimaryValue,
-                        Priority::Normal,
+                        QueueId::DEFAULT,
                         RetryPolicy::default(),
                     )
                     .await
@@ -324,7 +328,7 @@ async fn runner_handles_echo_noise_fragments_and_many_clients() {
                     .execute(
                         address,
                         &ReadLoopSignal,
-                        Priority::Normal,
+                        QueueId::DEFAULT,
                         RetryPolicy::default(),
                     )
                     .await
@@ -373,7 +377,7 @@ async fn managed_session_opens_cooldown_without_consuming_queue_capacity() {
     let retry = RetryPolicy::single_attempt(Duration::from_millis(15), Duration::from_millis(100));
 
     let first = managed
-        .execute(&ReadPrimaryValue, Priority::Normal, retry)
+        .execute(&ReadPrimaryValue, QueueId::DEFAULT, retry)
         .await
         .unwrap_err();
     assert!(matches!(
@@ -384,14 +388,14 @@ async fn managed_session_opens_cooldown_without_consuming_queue_capacity() {
     ));
     let started = client.snapshot().started;
     let second = managed
-        .execute(&ReadPrimaryValue, Priority::Normal, retry)
+        .execute(&ReadPrimaryValue, QueueId::DEFAULT, retry)
         .await
         .unwrap_err();
     assert!(matches!(second, ManagedSessionError::CoolingDown { .. }));
     assert_eq!(client.snapshot().started, started);
 
     let value = managed
-        .probe(&ReadPrimaryValue, Priority::Service, retry)
+        .probe(&ReadPrimaryValue, QueueId::DEFAULT, retry)
         .await
         .unwrap();
     assert!((value.value - 123.5).abs() < f32::EPSILON);
@@ -434,11 +438,11 @@ async fn managed_session_adapts_only_registered_read_only_commands() {
         .with_total_timeout(Duration::from_secs(1));
 
     managed
-        .execute(&ReadPrimaryValue, Priority::Normal, retry)
+        .execute(&ReadPrimaryValue, QueueId::DEFAULT, retry)
         .await
         .unwrap();
     managed
-        .execute(&ReadPrimaryValue, Priority::Normal, retry)
+        .execute(&ReadPrimaryValue, QueueId::DEFAULT, retry)
         .await
         .unwrap();
     let health = managed.snapshot();
@@ -448,7 +452,7 @@ async fn managed_session_adapts_only_registered_read_only_commands() {
 
     let forged_vendor_read = RawOperation::read(60_000u16, Vec::new());
     let error = managed
-        .probe(&forged_vendor_read, Priority::Service, retry)
+        .probe(&forged_vendor_read, QueueId::DEFAULT, retry)
         .await
         .unwrap_err();
     assert!(matches!(
@@ -490,11 +494,11 @@ async fn adaptive_timeout_falls_back_within_the_original_retry_budget() {
         .with_total_timeout(Duration::from_millis(200));
 
     managed
-        .execute(&ReadPrimaryValue, Priority::Normal, retry)
+        .execute(&ReadPrimaryValue, QueueId::DEFAULT, retry)
         .await
         .unwrap();
     let value = managed
-        .execute(&ReadPrimaryValue, Priority::Normal, retry)
+        .execute(&ReadPrimaryValue, QueueId::DEFAULT, retry)
         .await
         .unwrap();
     assert!((value.value - 123.5).abs() < f32::EPSILON);
@@ -549,14 +553,14 @@ async fn total_deadline_limits_waiting_for_queue_capacity() {
     let address = Address::polling(1, Master::Primary).unwrap();
     let (host, _peer) = MemoryChannel::pair(1);
     let config = hart_link::LinkConfig {
-        normal_capacity: 1,
+        queue_capacity: 1,
         ..hart_link::LinkConfig::default()
     };
     let (client, _runner) = hart_link::create_link(host, config);
     let first = client
         .start(
             Request::new(address, 0u8, vec![]),
-            Priority::Normal,
+            QueueId::DEFAULT,
             RetryPolicy::default(),
         )
         .await
@@ -565,7 +569,7 @@ async fn total_deadline_limits_waiting_for_queue_capacity() {
     let error = client
         .request(
             Request::new(address, 1u8, vec![]),
-            Priority::Normal,
+            QueueId::DEFAULT,
             RetryPolicy {
                 total_timeout: Duration::from_millis(20),
                 ..RetryPolicy::default()
@@ -575,7 +579,7 @@ async fn total_deadline_limits_waiting_for_queue_capacity() {
         .unwrap_err();
     assert!(matches!(error, hart_link::ExchangeError::Deadline));
     assert!(started.elapsed() < Duration::from_millis(200));
-    assert_eq!(client.snapshot().queued_normal, 1);
+    assert_eq!(client.snapshot().queued, 1);
     drop(first);
 }
 
@@ -633,13 +637,13 @@ fn validated_link_constructor_rejects_ambiguous_zero_limits() {
     let result = hart_link::try_create_link(
         host,
         hart_link::LinkConfig {
-            normal_capacity: 0,
+            queue_capacity: 0,
             ..hart_link::LinkConfig::default()
         },
     );
     assert!(matches!(
         result,
-        Err(hart_link::LinkConfigError::NormalCapacity)
+        Err(hart_link::LinkConfigError::QueueCapacity)
     ));
 }
 
@@ -650,11 +654,11 @@ fn validated_link_constructor_rejects_resource_amplifying_limits() {
         hart_link::try_create_link(
             host,
             hart_link::LinkConfig {
-                service_capacity: usize::MAX,
+                queue_capacity: usize::MAX,
                 ..hart_link::LinkConfig::default()
             }
         ),
-        Err(hart_link::LinkConfigError::ServiceCapacityLimit(_))
+        Err(hart_link::LinkConfigError::QueueCapacityLimit(_))
     ));
 
     let (host, _peer) = MemoryChannel::pair(1);
@@ -701,13 +705,13 @@ fn request_rejects_resource_pinning_timeouts_before_enqueueing() {
     let policy = RetryPolicy::default()
         .with_total_timeout(hart_link::MAXIMUM_RETRY_DURATION + Duration::from_secs(1));
     let error = client
-        .try_start(request, Priority::Normal, policy)
+        .try_start(request, QueueId::DEFAULT, policy)
         .unwrap_err();
     assert!(matches!(
         error,
         hart_link::StartError::RetryPolicy(hart_link::RetryPolicyError::TotalTimeoutLimit)
     ));
-    assert_eq!(client.snapshot().queued_normal, 0);
+    assert_eq!(client.snapshot().queued, 0);
 }
 
 #[tokio::test]
@@ -718,7 +722,7 @@ async fn request_rejects_a_zero_timeout_before_enqueueing() {
     let error = client
         .request(
             Request::new(address, 0u8, vec![]),
-            Priority::Normal,
+            QueueId::DEFAULT,
             RetryPolicy {
                 response_timeout: Duration::ZERO,
                 ..RetryPolicy::default()
@@ -730,7 +734,7 @@ async fn request_rejects_a_zero_timeout_before_enqueueing() {
         error,
         hart_link::ExchangeError::RetryPolicy(hart_link::RetryPolicyError::ResponseTimeout)
     ));
-    assert_eq!(client.snapshot().queued_normal, 0);
+    assert_eq!(client.snapshot().queued, 0);
 }
 
 #[tokio::test]
@@ -742,13 +746,13 @@ async fn request_rejects_an_oversized_transmit_prefix_before_enqueueing() {
         .start_with_prefix(
             Request::new(address, 0u8, vec![]),
             vec![0; hart_link::MAXIMUM_TRANSMIT_PREFIX + 1],
-            Priority::Service,
+            QueueId::DEFAULT,
             RetryPolicy::default(),
         )
         .await
         .unwrap_err();
     assert!(matches!(error, hart_link::StartError::TransmitPrefix(_)));
-    assert_eq!(client.snapshot().queued_service, 0);
+    assert_eq!(client.snapshot().queued, 0);
 }
 
 #[tokio::test]
@@ -759,7 +763,7 @@ async fn request_rejects_an_oversized_frame_before_enqueueing() {
     let error = client
         .try_start(
             Request::new(address, 1u8, vec![0; 256]),
-            Priority::Normal,
+            QueueId::DEFAULT,
             RetryPolicy::default(),
         )
         .unwrap_err();
@@ -767,7 +771,7 @@ async fn request_rejects_an_oversized_frame_before_enqueueing() {
         error,
         hart_link::service::StartError::Operation(_)
     ));
-    assert_eq!(client.snapshot().queued_normal, 0);
+    assert_eq!(client.snapshot().queued, 0);
 }
 
 #[tokio::test]
@@ -778,7 +782,7 @@ async fn an_indeterminate_send_stops_the_runner_instead_of_reusing_the_stream() 
     let error = client
         .request(
             Request::new(address, 0u8, vec![]),
-            Priority::Normal,
+            QueueId::DEFAULT,
             RetryPolicy {
                 response_timeout: Duration::from_millis(10),
                 total_timeout: Duration::from_millis(20),
@@ -792,7 +796,7 @@ async fn an_indeterminate_send_stops_the_runner_instead_of_reusing_the_stream() 
     assert!(matches!(
         client.try_start(
             Request::new(address, 0u8, vec![]),
-            Priority::Normal,
+            QueueId::DEFAULT,
             RetryPolicy::default(),
         ),
         Err(hart_link::service::StartError::Closed)
@@ -819,7 +823,7 @@ async fn total_deadline_covers_missing_response() {
         ..RetryPolicy::default()
     };
     let error = client
-        .execute(address, &ReadDeviceIdentity, Priority::Normal, policy)
+        .execute(address, &ReadDeviceIdentity, QueueId::DEFAULT, policy)
         .await
         .unwrap_err();
     assert!(matches!(
@@ -851,7 +855,7 @@ async fn late_response_guard_drains_an_uncorrelatable_timed_out_reply() {
     let first = client
         .request(
             Request::new(address, 1u8, vec![]),
-            Priority::Normal,
+            QueueId::DEFAULT,
             RetryPolicy::default()
                 .with_transport_retries(0)
                 .with_response_timeout(Duration::from_millis(10))
@@ -866,7 +870,7 @@ async fn late_response_guard_drains_an_uncorrelatable_timed_out_reply() {
     let second = client
         .request(
             Request::new(address, 1u8, vec![]),
-            Priority::Normal,
+            QueueId::DEFAULT,
             RetryPolicy::default()
                 .with_transport_retries(0)
                 .with_response_timeout(Duration::from_millis(100))
@@ -921,7 +925,7 @@ async fn busy_and_delayed_response_have_independent_retry_limits() {
     let reply = client
         .request(
             request,
-            Priority::Normal,
+            QueueId::DEFAULT,
             RetryPolicy {
                 transport_retries: 0,
                 busy_retries: 1,
@@ -963,11 +967,11 @@ async fn identical_read_only_requests_share_one_successful_exchange() {
     .expect("bounded replay scenario");
     let (client, runner) = hart_link::create_link(channel, hart_link::LinkConfig::default());
     let first = client
-        .start(request.clone(), Priority::Normal, RetryPolicy::default())
+        .start(request.clone(), QueueId::DEFAULT, RetryPolicy::default())
         .await
         .unwrap();
     let second = client
-        .start(request, Priority::Normal, RetryPolicy::default())
+        .start(request, QueueId::DEFAULT, RetryPolicy::default())
         .await
         .unwrap();
     let runner_task = tokio::spawn(runner.run());
@@ -977,7 +981,7 @@ async fn identical_read_only_requests_share_one_successful_exchange() {
     assert_eq!(snapshot.started, 1);
     assert_eq!(snapshot.completed, 2);
     assert_eq!(snapshot.coalesced, 1);
-    assert_eq!(snapshot.queued_normal, 0);
+    assert_eq!(snapshot.queued, 0);
     drop(client);
     runner_task.await.unwrap();
 }
@@ -1008,11 +1012,11 @@ async fn action_requests_are_never_coalesced() {
     .expect("bounded replay scenario");
     let (client, runner) = hart_link::create_link(channel, hart_link::LinkConfig::default());
     let first = client
-        .start(request.clone(), Priority::Normal, RetryPolicy::default())
+        .start(request.clone(), QueueId::DEFAULT, RetryPolicy::default())
         .await
         .unwrap();
     let second = client
-        .start(request, Priority::Normal, RetryPolicy::default())
+        .start(request, QueueId::DEFAULT, RetryPolicy::default())
         .await
         .unwrap();
     let runner_task = tokio::spawn(runner.run());
@@ -1040,7 +1044,7 @@ async fn calibration_timeout_never_repeats_the_physical_request() {
                 36u8,
                 Vec::new(),
             ),
-            Priority::Normal,
+            QueueId::DEFAULT,
             RetryPolicy::default()
                 .with_transport_retries(5)
                 .with_response_timeout(Duration::from_millis(10))
@@ -1055,7 +1059,7 @@ async fn calibration_timeout_never_repeats_the_physical_request() {
 }
 
 #[tokio::test]
-async fn service_weight_prevents_normal_queue_starvation() {
+async fn weighted_queues_preserve_the_configured_share_without_starvation() {
     let address = Address::polling(1, Master::Primary).unwrap();
     let ordered = [10u8, 11, 20, 12, 13, 21, 14];
     let mut steps = Vec::new();
@@ -1081,16 +1085,21 @@ async fn service_weight_prevents_normal_queue_starvation() {
         steps.push(ReplayStep::Provide(response));
     }
     let channel = ReplayChannel::new(steps).expect("bounded replay scenario");
-    let scheduling = hart_link::QueueScheduling::custom(2).unwrap();
-    let config = hart_link::LinkConfig::default().with_queue_scheduling(scheduling);
-    let (client, runner) = hart_link::create_link(channel, config);
+    let (client, runner) = LinkBuilder::new(channel)
+        .queues([
+            hart_link::QueueConfig::weighted(FAST_QUEUE, 16, 2).unwrap(),
+            hart_link::QueueConfig::weighted(REGULAR_QUEUE, 16, 1).unwrap(),
+        ])
+        .default_queue(FAST_QUEUE)
+        .build()
+        .unwrap();
     let mut waits = Vec::new();
     for command in 10u8..=14 {
         waits.push(
             client
                 .start(
                     Request::new(address, command, vec![]),
-                    Priority::Service,
+                    FAST_QUEUE,
                     RetryPolicy::default(),
                 )
                 .await
@@ -1102,7 +1111,7 @@ async fn service_weight_prevents_normal_queue_starvation() {
             client
                 .start(
                     Request::new(address, command, vec![]),
-                    Priority::Normal,
+                    REGULAR_QUEUE,
                     RetryPolicy::default(),
                 )
                 .await
@@ -1119,12 +1128,15 @@ async fn service_weight_prevents_normal_queue_starvation() {
 }
 
 #[tokio::test]
-async fn service_weight_changes_atomically_after_the_current_exchange() {
+async fn queue_weight_changes_atomically_after_the_current_exchange() {
     let address = Address::polling(1, Master::Primary).unwrap();
     let (channel, first_response_gate, commands) = GatedSchedulerChannel::new(address);
-    let scheduling = hart_link::QueueScheduling::custom(3).unwrap();
     let (client, runner) = LinkBuilder::new(channel)
-        .queue_scheduling(scheduling)
+        .queues([
+            hart_link::QueueConfig::weighted(FAST_QUEUE, 16, 3).unwrap(),
+            hart_link::QueueConfig::weighted(REGULAR_QUEUE, 16, 1).unwrap(),
+        ])
+        .default_queue(FAST_QUEUE)
         .build()
         .unwrap();
     let mut events = client.subscribe();
@@ -1134,7 +1146,7 @@ async fn service_weight_changes_atomically_after_the_current_exchange() {
             client
                 .start(
                     Request::new(address, command, vec![]),
-                    Priority::Service,
+                    FAST_QUEUE,
                     RetryPolicy::default(),
                 )
                 .await
@@ -1146,7 +1158,7 @@ async fn service_weight_changes_atomically_after_the_current_exchange() {
             client
                 .start(
                     Request::new(address, command, vec![]),
-                    Priority::Normal,
+                    REGULAR_QUEUE,
                     RetryPolicy::default(),
                 )
                 .await
@@ -1160,11 +1172,11 @@ async fn service_weight_changes_atomically_after_the_current_exchange() {
             break;
         }
     }
-    assert_eq!(client.service_weight(), 3);
-    client.set_service_weight(1).unwrap();
-    assert_eq!(client.service_weight(), 1);
-    assert!(client.set_service_weight(0).is_err());
-    assert_eq!(client.service_weight(), 1);
+    assert_eq!(client.queue_priority(FAST_QUEUE).unwrap().weight(), Some(3));
+    client.set_queue_weight(FAST_QUEUE, 1).unwrap();
+    assert_eq!(client.queue_priority(FAST_QUEUE).unwrap().weight(), Some(1));
+    assert!(client.set_queue_weight(FAST_QUEUE, 0).is_err());
+    assert_eq!(client.queue_priority(FAST_QUEUE).unwrap().weight(), Some(1));
 
     first_response_gate.notify_one();
     for reply in pending {
@@ -1177,41 +1189,115 @@ async fn service_weight_changes_atomically_after_the_current_exchange() {
 }
 
 #[test]
-fn queue_scheduling_presets_are_valid_and_explicit() {
-    assert_eq!(hart_link::QueueScheduling::EQUAL.service_weight(), 1);
+fn queue_priorities_are_valid_and_explicit() {
     assert_eq!(
-        hart_link::QueueScheduling::MAXIMUM_SERVICE.service_weight(),
-        u8::MAX
+        hart_link::QueuePriority::weighted(4).unwrap().weight(),
+        Some(4)
     );
-    assert_eq!(
-        hart_link::QueueScheduling::custom(4)
-            .unwrap()
-            .service_weight(),
-        4
-    );
-    assert!(hart_link::QueueScheduling::custom(0).is_err());
-
-    let config =
-        hart_link::LinkConfig::default().with_queue_scheduling(hart_link::QueueScheduling::EQUAL);
-    assert_eq!(config.service_weight, 1);
+    assert!(hart_link::QueuePriority::weighted(0).is_err());
+    assert_eq!(hart_link::QueuePriority::strict(7).strict_rank(), Some(7));
+    assert!(hart_link::QueueConfig::weighted(FAST_QUEUE, 0, 1).is_err());
+    assert!(hart_link::QueueConfig::weighted(FAST_QUEUE, 8, 0).is_err());
 }
 
 #[test]
-fn concurrent_service_weight_updates_are_atomic() {
+fn queue_layout_rejects_empty_duplicate_missing_default_and_excessive_capacity() {
+    let (channel, _device) = MemoryChannel::try_pair(8).unwrap();
+    assert!(matches!(
+        LinkBuilder::new(channel).queues([]).build(),
+        Err(hart_link::LinkBuildError::Queues(
+            hart_link::QueueConfigError::Empty
+        ))
+    ));
+
+    let (channel, _device) = MemoryChannel::try_pair(8).unwrap();
+    let duplicate = hart_link::QueueConfig::weighted(FAST_QUEUE, 8, 1).unwrap();
+    assert!(matches!(
+        LinkBuilder::new(channel)
+            .queues([duplicate, duplicate])
+            .default_queue(FAST_QUEUE)
+            .build(),
+        Err(hart_link::LinkBuildError::Queues(
+            hart_link::QueueConfigError::DuplicateId(FAST_QUEUE)
+        ))
+    ));
+
+    let (channel, _device) = MemoryChannel::try_pair(8).unwrap();
+    assert!(matches!(
+        LinkBuilder::new(channel)
+            .queues([hart_link::QueueConfig::weighted(FAST_QUEUE, 8, 1).unwrap()])
+            .default_queue(REGULAR_QUEUE)
+            .build(),
+        Err(hart_link::LinkBuildError::Queues(
+            hart_link::QueueConfigError::MissingDefault(REGULAR_QUEUE)
+        ))
+    ));
+
+    let (channel, _device) = MemoryChannel::try_pair(8).unwrap();
+    assert!(matches!(
+        LinkBuilder::new(channel)
+            .queues([
+                hart_link::QueueConfig::weighted(FAST_QUEUE, 600_000, 1).unwrap(),
+                hart_link::QueueConfig::weighted(REGULAR_QUEUE, 600_000, 1).unwrap(),
+            ])
+            .default_queue(FAST_QUEUE)
+            .build(),
+        Err(hart_link::LinkBuildError::Queues(
+            hart_link::QueueConfigError::TotalCapacity(_)
+        ))
+    ));
+}
+
+#[test]
+fn queue_handles_and_unknown_queue_errors_are_explicit() {
+    let (channel, _device) = MemoryChannel::try_pair(8).unwrap();
+    let (client, _runner) = LinkBuilder::new(channel)
+        .queues([
+            hart_link::QueueConfig::weighted(FAST_QUEUE, 8, 4).unwrap(),
+            hart_link::QueueConfig::weighted(REGULAR_QUEUE, 8, 1).unwrap(),
+        ])
+        .default_queue(REGULAR_QUEUE)
+        .build()
+        .unwrap();
+    assert_eq!(client.default_queue().id(), REGULAR_QUEUE);
+    assert_eq!(client.queue(FAST_QUEUE).unwrap().id(), FAST_QUEUE);
+    assert!(matches!(
+        client.queue(STRICT_QUEUE),
+        Err(hart_link::QueueError::Unknown(STRICT_QUEUE))
+    ));
+    assert!(matches!(
+        client.try_start(
+            Request::new(Address::polling(1, Master::Primary).unwrap(), 0_u8, vec![]),
+            STRICT_QUEUE,
+            RetryPolicy::default(),
+        ),
+        Err(hart_link::StartError::UnknownQueue(STRICT_QUEUE))
+    ));
+}
+
+#[test]
+fn concurrent_queue_weight_updates_are_atomic() {
     let (channel, _device) = MemoryChannel::try_pair(8).unwrap();
     let (client, _runner) = LinkBuilder::new(channel).build().unwrap();
     let mut workers = Vec::new();
     for weight in 4_u8..=11 {
         let client = client.clone();
         workers.push(std::thread::spawn(move || {
-            client.set_service_weight(weight).unwrap();
+            client
+                .set_queue_weight(QueueId::DEFAULT, u16::from(weight))
+                .unwrap();
         }));
     }
     for worker in workers {
         worker.join().unwrap();
     }
 
-    assert!((4..=11).contains(&client.service_weight()));
+    let weight = client
+        .queue_priority(QueueId::DEFAULT)
+        .unwrap()
+        .weight()
+        .unwrap();
+    assert!((4..=11).contains(&weight));
 }
 
 #[test]
@@ -1259,7 +1345,7 @@ fn command_policy_rejects_before_queue_capacity_is_used() {
         hart_link::StartError::CommandDenied {
             command: 42,
             safety: hart_link::catalog::OperationSafety::Action,
-            priority: Priority::Normal,
+            queue: QueueId::DEFAULT,
         }
     ));
     assert!(matches!(
@@ -1267,12 +1353,12 @@ fn command_policy_rejects_before_queue_capacity_is_used() {
         hart_link::LinkEvent::Denied {
             command: 42,
             safety: hart_link::OperationSafety::Action,
-            priority: Priority::Normal,
+            queue: QueueId::DEFAULT,
         }
     ));
     let snapshot = client.snapshot();
     assert_eq!(snapshot.denied, 1);
-    assert_eq!(snapshot.queued_service + snapshot.queued_normal, 0);
+    assert_eq!(snapshot.queued, 0);
 }
 
 #[test]
@@ -1304,7 +1390,7 @@ fn strict_safety_policy_cannot_be_bypassed_by_request_metadata() {
                 .with_retry_safety(hart_link::OperationSafety::ReadOnly),
         )
         .unwrap();
-    assert_eq!(explicit.snapshot().queued_normal, 1);
+    assert_eq!(explicit.snapshot().queued, 1);
     drop(accepted);
 }
 
@@ -1312,32 +1398,43 @@ fn strict_safety_policy_cannot_be_bypassed_by_request_metadata() {
 fn routing_is_applied_before_queue_specific_admission() {
     let (channel, _peer) = MemoryChannel::pair(2);
     let policy = hart_link::CommandPolicy::custom(|context| {
-        context.request.command == hart_link::CommandCode::new(0)
-            && context.priority == Priority::Service
+        context.request.command == hart_link::CommandCode::new(0) && context.queue == FAST_QUEUE
     });
-    let routing = hart_link::CommandRouting::service_commands([hart_link::CommandCode::new(0)]);
+    let routing =
+        hart_link::CommandRouting::commands_to(FAST_QUEUE, [hart_link::CommandCode::new(0)]);
     let (client, _runner) = LinkBuilder::new(channel)
+        .queues([
+            hart_link::QueueConfig::weighted(FAST_QUEUE, 2, 4).unwrap(),
+            hart_link::QueueConfig::weighted(REGULAR_QUEUE, 2, 1).unwrap(),
+        ])
+        .default_queue(REGULAR_QUEUE)
         .command_routing(routing)
         .command_policy(policy)
         .build()
         .unwrap();
     let request = Request::new(Address::polling(1, Master::Primary).unwrap(), 0u8, vec![]);
     let _pending = client
-        .try_start(request, Priority::Normal, RetryPolicy::default())
+        .try_start(request, REGULAR_QUEUE, RetryPolicy::default())
         .unwrap();
-    assert_eq!(client.snapshot().queued_service, 1);
-    assert_eq!(client.snapshot().queued_normal, 0);
+    assert_eq!(client.snapshot().queued, 1);
+    assert_eq!(client.queue_snapshot(FAST_QUEUE).unwrap().queued, 1);
+    assert_eq!(client.queue_snapshot(REGULAR_QUEUE).unwrap().queued, 0);
 }
 
 #[test]
 fn policy_sugar_composes_command_and_queue_filters() {
     let command_0 = hart_link::CommandCode::new(0);
     let command_42 = hart_link::CommandCode::new(42);
-    let service_policy = hart_link::CommandPolicy::queue_allowlist(Priority::Service, [command_0]);
-    let policy = service_policy.and(hart_link::CommandPolicy::deny_commands([command_42]));
-    let routing = hart_link::CommandRouting::service_commands([command_0, command_42]);
+    let privileged_policy = hart_link::CommandPolicy::queue_allowlist(FAST_QUEUE, [command_0]);
+    let policy = privileged_policy.and(hart_link::CommandPolicy::deny_commands([command_42]));
+    let routing = hart_link::CommandRouting::commands_to(FAST_QUEUE, [command_0, command_42]);
     let (channel, _peer) = MemoryChannel::pair(4);
     let (client, _runner) = LinkBuilder::new(channel)
+        .queues([
+            hart_link::QueueConfig::weighted(FAST_QUEUE, 4, 4).unwrap(),
+            hart_link::QueueConfig::weighted(REGULAR_QUEUE, 4, 1).unwrap(),
+        ])
+        .default_queue(REGULAR_QUEUE)
         .command_routing(routing)
         .command_policy(policy)
         .build()
@@ -1358,13 +1455,13 @@ fn policy_sugar_composes_command_and_queue_filters() {
         denied,
         hart_link::StartError::CommandDenied { command: 42, .. }
     ));
-    assert_eq!(client.snapshot().queued_service, 1);
+    assert_eq!(client.snapshot().queued, 1);
     assert_eq!(client.snapshot().denied, 1);
     drop(accepted);
 }
 
 #[tokio::test]
-async fn single_queue_preserves_global_fifo_and_ignores_priority() {
+async fn one_queue_layout_preserves_global_fifo() {
     let address = Address::polling(1, Master::Primary).unwrap();
     let mut steps = Vec::new();
     for command in [20u8, 10] {
@@ -1389,11 +1486,14 @@ async fn single_queue_preserves_global_fifo_and_ignores_priority() {
         steps.push(ReplayStep::Provide(response));
     }
     let channel = ReplayChannel::new(steps).unwrap();
-    let (client, runner) = LinkBuilder::new(channel).single_queue(8).build().unwrap();
+    let (client, runner) = LinkBuilder::new(channel)
+        .queues([hart_link::QueueConfig::weighted(QueueId::DEFAULT, 8, 1).unwrap()])
+        .build()
+        .unwrap();
     let first = client
         .start(
             Request::new(address, 20u8, vec![]),
-            Priority::Normal,
+            QueueId::DEFAULT,
             RetryPolicy::default(),
         )
         .await
@@ -1401,17 +1501,73 @@ async fn single_queue_preserves_global_fifo_and_ignores_priority() {
     let second = client
         .start(
             Request::new(address, 10u8, vec![]),
-            Priority::Service,
+            QueueId::DEFAULT,
             RetryPolicy::default(),
         )
         .await
         .unwrap();
-    assert_eq!(client.queue_mode(), hart_link::QueueMode::SingleFifo);
-    assert_eq!(client.snapshot().queued_service, 0);
-    assert_eq!(client.snapshot().queued_normal, 2);
+    assert_eq!(client.queue_snapshots().len(), 1);
+    assert_eq!(client.snapshot().queued, 2);
     let runner_task = tokio::spawn(runner.run());
     first.wait().await.unwrap();
     second.wait().await.unwrap();
+    drop(client);
+    runner_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn strict_queue_is_selected_before_ready_weighted_queues() {
+    let address = Address::polling(1, Master::Primary).unwrap();
+    let mut steps = Vec::new();
+    for command in [20_u8, 10] {
+        let request = Request::new(address, command, vec![])
+            .to_frame()
+            .unwrap()
+            .encode()
+            .unwrap();
+        let response = Frame {
+            preambles: 5,
+            kind: FrameKind::Response,
+            physical_layer: PhysicalLayer::Fsk,
+            address,
+            expansion: vec![],
+            wire_command: command,
+            payload: vec![0, 0],
+            repair: None,
+        }
+        .encode()
+        .unwrap();
+        steps.push(ReplayStep::Expect(request));
+        steps.push(ReplayStep::Provide(response));
+    }
+    let channel = ReplayChannel::new(steps).unwrap();
+    let (client, runner) = LinkBuilder::new(channel)
+        .queues([
+            hart_link::QueueConfig::weighted(REGULAR_QUEUE, 8, 100).unwrap(),
+            hart_link::QueueConfig::strict(STRICT_QUEUE, 8, 1).unwrap(),
+        ])
+        .default_queue(REGULAR_QUEUE)
+        .build()
+        .unwrap();
+    let regular = client
+        .start(
+            Request::new(address, 10_u8, vec![]),
+            REGULAR_QUEUE,
+            RetryPolicy::default(),
+        )
+        .await
+        .unwrap();
+    let strict = client
+        .start(
+            Request::new(address, 20_u8, vec![]),
+            STRICT_QUEUE,
+            RetryPolicy::default(),
+        )
+        .await
+        .unwrap();
+    let runner_task = tokio::spawn(runner.run());
+    strict.wait().await.unwrap();
+    regular.wait().await.unwrap();
     drop(client);
     runner_task.await.unwrap();
 }
@@ -1501,7 +1657,7 @@ async fn discovery_revisits_only_missing_addresses_on_later_passes() {
         Master::Primary,
         DiscoveryOptions {
             passes: std::num::NonZeroU8::new(2).unwrap(),
-            priority: Priority::Service,
+            queue: QueueId::DEFAULT,
             retry,
             pass_delay: Duration::ZERO,
             preamble_hints: DiscoveryHints::new(),
@@ -1661,7 +1817,7 @@ async fn plan_data_prefix_never_turns_an_error_response_into_success() {
         steps: vec![PlanStep {
             name: "error-prefix".into(),
             request,
-            priority: Priority::Normal,
+            queue: QueueId::DEFAULT,
             retry: RetryPolicy::default(),
             expectation: PlanExpectation::DataPrefix(vec![0xaa]),
         }],
@@ -1690,7 +1846,7 @@ async fn dropping_the_waiter_drains_an_inflight_exchange_before_cancelling_inter
     let pending = client
         .start(
             Request::new(address, 0u8, vec![]),
-            Priority::Normal,
+            QueueId::DEFAULT,
             RetryPolicy {
                 response_timeout: Duration::from_secs(5),
                 total_timeout: Duration::from_secs(10),

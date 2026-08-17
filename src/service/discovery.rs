@@ -10,7 +10,7 @@ use crate::{
     Address, Master,
     operation::{DeviceIdentity, Operation, ReadDeviceIdentity, Request},
     profile::{AddressTiming, AddressTimings, LineProfile},
-    service::{ExchangeError, LinkClient, Priority, RetryPolicy},
+    service::{ExchangeError, LinkClient, QueueId, RetryPolicy},
 };
 
 /// One identified device.
@@ -113,8 +113,8 @@ pub enum DiscoveryHintError {
 pub struct DiscoveryOptions {
     /// Maximum passes; addresses already identified are skipped in later passes.
     pub passes: NonZeroU8,
-    /// Queue priority assigned to discovery requests.
-    pub priority: Priority,
+    /// Queue assigned to discovery requests.
+    pub queue: QueueId,
     /// Retry counts and delay; response and total timeouts are adapted to the line profile.
     pub retry: RetryPolicy,
     /// Delay between incomplete passes; no delay is applied after all addresses respond.
@@ -127,7 +127,7 @@ impl Default for DiscoveryOptions {
     fn default() -> Self {
         Self {
             passes: NonZeroU8::MIN,
-            priority: Priority::Service,
+            queue: QueueId::DEFAULT,
             retry: RetryPolicy::default(),
             pass_delay: Duration::ZERO,
             preamble_hints: DiscoveryHints::new(),
@@ -142,9 +142,9 @@ impl DiscoveryOptions {
         self
     }
 
-    /// Sets the queue priority of every discovery probe.
-    pub const fn with_priority(mut self, priority: Priority) -> Self {
-        self.priority = priority;
+    /// Sets the queue used by every discovery probe.
+    pub const fn with_queue(mut self, queue: QueueId) -> Self {
+        self.queue = queue;
         self
     }
 
@@ -191,7 +191,7 @@ pub async fn discover_line(
     Ok(discover_validated(link, profile, master, DiscoveryOptions::default(), None).await)
 }
 
-/// Scans a line repeatedly with explicit priority and retry settings.
+/// Scans a line repeatedly with explicit queue and retry settings.
 pub async fn discover_line_with_options(
     link: &LinkClient,
     profile: &LineProfile,
@@ -295,7 +295,7 @@ async fn discover_validated(
                     let request = Request::new(address, 0u8, Vec::new()).with_preambles(preambles);
                     let prefix = wake_prefix.take().unwrap_or_default();
                     match link
-                        .request_with_prefix(request, prefix, options.priority, retry)
+                        .request_with_prefix(request, prefix, options.queue, retry)
                         .await
                     {
                         Ok(reply) => {

@@ -1,0 +1,83 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="600" viewBox="0 0 1280 600" role="img" aria-labelledby="title description">
+  <title id="title">HartLink universal multi-queue scheduler</title>
+  <desc id="description">Application components use queue-bound clients. Independently bounded strict and weighted queues feed one scheduler and one physical link runner.</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#08111f"/>
+      <stop offset="1" stop-color="#17213a"/>
+    </linearGradient>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="5" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0 L0 10 L10 5 Z" fill="#7dd3fc"/>
+    </marker>
+    <filter id="shadow">
+      <feDropShadow dx="0" dy="5" stdDeviation="6" flood-color="#020617" flood-opacity="0.5"/>
+    </filter>
+  </defs>
+  <rect width="1280" height="600" rx="24" fill="url(#background)"/>
+  <text x="48" y="52" fill="#f8fafc" font-family="Inter, Segoe UI, sans-serif" font-size="27" font-weight="700">One scheduler for any queue layout</text>
+  <text x="48" y="82" fill="#94a3b8" font-family="Inter, Segoe UI, sans-serif" font-size="15">One queue, two queues, and larger layouts use the same bounded execution path.</text>
+
+  <g font-family="Inter, Segoe UI, sans-serif" text-anchor="middle" filter="url(#shadow)">
+    <g transform="translate(42 178)">
+      <rect width="190" height="92" rx="16" fill="#172554" stroke="#60a5fa" stroke-width="2"/>
+      <text x="95" y="39" fill="#dbeafe" font-size="17" font-weight="700">Application task</text>
+      <text x="95" y="64" fill="#93c5fd" font-size="14">cloned QueueClient</text>
+    </g>
+    <g transform="translate(42 340)">
+      <rect width="190" height="92" rx="16" fill="#172554" stroke="#60a5fa" stroke-width="2"/>
+      <text x="95" y="39" fill="#dbeafe" font-size="17" font-weight="700">Application task</text>
+      <text x="95" y="64" fill="#93c5fd" font-size="14">cloned QueueClient</text>
+    </g>
+
+    <g transform="translate(300 230)">
+      <rect width="200" height="110" rx="18" fill="#4c1d95" stroke="#c084fc" stroke-width="2"/>
+      <text x="100" y="50" fill="#f3e8ff" font-size="17" font-weight="700">Route + policy</text>
+      <text x="100" y="75" fill="#d8b4fe" font-size="13">resolve QueueId</text>
+    </g>
+
+    <g transform="translate(575 120)">
+      <rect width="220" height="88" rx="16" fill="#7f1d1d" stroke="#fb7185" stroke-width="2"/>
+      <text x="110" y="37" fill="#ffe4e6" font-size="17" font-weight="700">Strict queue · rank 10</text>
+      <text x="110" y="62" fill="#fda4af" font-size="13">independent bounded FIFO</text>
+    </g>
+    <g transform="translate(575 256)">
+      <rect width="220" height="88" rx="16" fill="#064e3b" stroke="#34d399" stroke-width="2"/>
+      <text x="110" y="37" fill="#d1fae5" font-size="17" font-weight="700">Weighted queue · 4</text>
+      <text x="110" y="62" fill="#6ee7b7" font-size="13">independent bounded FIFO</text>
+    </g>
+    <g transform="translate(575 392)">
+      <rect width="220" height="88" rx="16" fill="#164e63" stroke="#22d3ee" stroke-width="2"/>
+      <text x="110" y="37" fill="#cffafe" font-size="17" font-weight="700">Weighted queue · 1</text>
+      <text x="110" y="62" fill="#67e8f9" font-size="13">independent bounded FIFO</text>
+    </g>
+
+    <g transform="translate(875 230)">
+      <rect width="205" height="140" rx="18" fill="#713f12" stroke="#fbbf24" stroke-width="2"/>
+      <text x="102" y="43" fill="#fef3c7" font-size="18" font-weight="700">Scheduler</text>
+      <text x="102" y="71" fill="#fde68a" font-size="13">strict ranks first</text>
+      <text x="102" y="94" fill="#fde68a" font-size="13">weighted round-robin</text>
+      <text x="102" y="117" fill="#fde68a" font-size="13">live atomic changes</text>
+    </g>
+
+    <g transform="translate(1140 230)">
+      <rect width="105" height="140" rx="18" fill="#312e81" stroke="#a78bfa" stroke-width="2"/>
+      <text x="52" y="54" fill="#ede9fe" font-size="17" font-weight="700">Runner</text>
+      <text x="52" y="81" fill="#c4b5fd" font-size="13">sole owner</text>
+      <text x="52" y="105" fill="#c4b5fd" font-size="13">of the line</text>
+    </g>
+  </g>
+
+  <g fill="none" stroke="#7dd3fc" stroke-width="3" marker-end="url(#arrow)">
+    <path d="M232 224 H265 V260 H285"/>
+    <path d="M232 386 H265 V310 H285"/>
+    <path d="M500 260 H530 V164 H560"/>
+    <path d="M500 285 H560"/>
+    <path d="M500 310 H530 V436 H560"/>
+    <path d="M795 164 H830 V273 H860"/>
+    <path d="M795 300 H860"/>
+    <path d="M795 436 H830 V327 H860"/>
+    <path d="M1080 300 H1125"/>
+  </g>
+
+  <text x="48" y="552" fill="#94a3b8" font-family="Inter, Segoe UI, sans-serif" font-size="14">Queue capacity is released when the runner selects work; the physical exchange remains strictly serialized.</text>
+</svg>

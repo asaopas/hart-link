@@ -10,7 +10,7 @@ use tokio::time::Instant;
 use crate::{
     CommandCode, Operation, OperationSafety, command_descriptor,
     service::{
-        DeviceSession, ExchangeError, MAXIMUM_RETRY_DURATION, Priority, RetryPolicy, SessionError,
+        DeviceSession, ExchangeError, MAXIMUM_RETRY_DURATION, QueueId, RetryPolicy, SessionError,
     },
 };
 
@@ -263,10 +263,10 @@ impl ManagedDeviceSession {
     pub async fn execute<O: Operation>(
         &self,
         operation: &O,
-        priority: Priority,
+        queue: QueueId,
         policy: RetryPolicy,
     ) -> Result<O::Output, ManagedSessionError> {
-        self.execute_inner(operation, priority, policy, false).await
+        self.execute_inner(operation, queue, policy, false).await
     }
 
     /// Executes with the defaults configured on the shared link.
@@ -276,7 +276,7 @@ impl ManagedDeviceSession {
     ) -> Result<O::Output, ManagedSessionError> {
         self.execute(
             operation,
-            self.session.link().default_priority(),
+            self.session.link().default_queue_id(),
             self.session.link().default_retry(),
         )
         .await
@@ -286,7 +286,7 @@ impl ManagedDeviceSession {
     pub async fn probe<O: Operation>(
         &self,
         operation: &O,
-        priority: Priority,
+        queue: QueueId,
         policy: RetryPolicy,
     ) -> Result<O::Output, ManagedSessionError> {
         if !registered_read_only(operation.command()) {
@@ -294,13 +294,13 @@ impl ManagedDeviceSession {
                 command: operation.command().get(),
             });
         }
-        self.execute_inner(operation, priority, policy, true).await
+        self.execute_inner(operation, queue, policy, true).await
     }
 
     async fn execute_inner<O: Operation>(
         &self,
         operation: &O,
-        priority: Priority,
+        queue: QueueId,
         policy: RetryPolicy,
         bypass_cooldown: bool,
     ) -> Result<O::Output, ManagedSessionError> {
@@ -308,7 +308,7 @@ impl ManagedDeviceSession {
         let logical_started = Instant::now();
         let Some(fast_timeout) = self.adaptive_timeout(operation.command(), policy) else {
             let attempt_started = Instant::now();
-            let result = self.session.execute(operation, priority, policy).await;
+            let result = self.session.execute(operation, queue, policy).await;
             return self.finish(result, attempt_started.elapsed(), operation.command());
         };
 
@@ -322,7 +322,7 @@ impl ManagedDeviceSession {
             ..policy
         };
         let fast_started = Instant::now();
-        match self.session.execute(operation, priority, fast_policy).await {
+        match self.session.execute(operation, queue, fast_policy).await {
             Ok(value) => {
                 self.record_success(fast_started.elapsed(), operation.command());
                 Ok(value)
@@ -348,7 +348,7 @@ impl ManagedDeviceSession {
                     ..policy
                 };
                 let fallback_started = Instant::now();
-                let result = self.session.execute(operation, priority, fallback).await;
+                let result = self.session.execute(operation, queue, fallback).await;
                 self.finish(result, fallback_started.elapsed(), operation.command())
             }
             Err(error) => {

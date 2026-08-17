@@ -27,7 +27,7 @@ opt-in Cargo features.
 | share one line between many tasks | clone `LinkClient`; keep exactly one `LinkRunner` for the channel |
 | discover devices behind a gateway or module | `LineProfile` and `discover_line` |
 | send a vendor-specific command | `RawOperation` or a custom `Operation` implementation |
-| choose strict priorities or plain FIFO | `QueueScheduling` or `LinkBuilder::single_queue` |
+| isolate traffic classes on one line | define `QueueConfig` values and keep one `QueueClient` per class |
 | test without hardware | the `emulator`, `trace`, and `verification` modules |
 | use only parsing in firmware | disable default features; the wire and operation core stays `no_std` |
 
@@ -72,20 +72,20 @@ transport:
 
 ```toml
 [dependencies]
-hart-link = "0.2"
+hart-link = "0.3"
 ```
 
 Choose only the hardware and subsystems the application actually uses:
 
 ```toml
 # Parser, encoder, inspector, operations, and common tables; no std or Tokio.
-hart-link = { version = "0.2", default-features = false }
+hart-link = { version = "0.3", default-features = false }
 
 # Runtime with both transparent TCP and serial transports.
-hart-link = { version = "0.2", features = ["serial"] }
+hart-link = { version = "0.3", features = ["serial"] }
 
 # Every optional subsystem, useful for a desktop laboratory tool.
-hart-link = { version = "0.2", features = ["full"] }
+hart-link = { version = "0.3", features = ["full"] }
 ```
 
 ## Architecture
@@ -162,7 +162,7 @@ application needs access to the line:
 
 ```rust,no_run
 use std::time::Duration;
-use hart_link::{Address, LinkBuilder, LinkConfig, Master, Priority, RetryPolicy};
+use hart_link::{Address, LinkBuilder, Master, QueueConfig, QueueId, RetryPolicy};
 use hart_link::channel::{TcpChannel, TcpOptions};
 use hart_link::operation::ReadDeviceIdentity;
 
@@ -172,9 +172,12 @@ let retry = RetryPolicy::default()
     .with_response_timeout(Duration::from_secs(2))
     .with_total_timeout(Duration::from_secs(10));
 let (client, runner) = LinkBuilder::new(channel)
-    .config(LinkConfig::default().with_queue_capacities(32, 512))
-    .queue_scheduling(hart_link::QueueScheduling::EQUAL)
-    .default_priority(Priority::Service)
+    .queues([
+        QueueConfig::weighted(QueueId::new(10), 64, 6)?,
+        QueueConfig::weighted(QueueId::new(20), 256, 2)?,
+        QueueConfig::weighted(QueueId::new(30), 512, 1)?,
+    ])
+    .default_queue(QueueId::new(20))
     .default_retry(retry)
     .event_capacity(1024)
     .maximum_coalesced(64)
@@ -223,112 +226,116 @@ before enqueueing, so time spent waiting behind other commands is never hidden.
 
 ![HartLink exchange lifecycle](docs/images/exchange-lifecycle.svg)
 
-## Queue modes and scheduling
+## Queues and scheduling
 
-HartLink has two explicit queue models. Select the simplest one that matches
-the application:
+Every link contains an application-defined layout of one to 256 independently
+bounded queues. There is no separate one-queue mode and no built-in traffic
+class: one queue, two queues, and a larger layout all use the same scheduler.
+Queue identifiers are small values chosen by the application; they do not
+change the HART frame or consume bytes on the physical line.
 
-| Mode | Ordering | Best fit |
-|---|---|---|
-| prioritized queues | weighted service/normal scheduling | interactive tools, shared gateways, and systems with latency classes |
-| one global queue | strict bounded FIFO; supplied priorities are ignored | one producer, simple polling loops, and applications that do not need priority |
+![HartLink multi-queue scheduler](docs/images/multi-queue-scheduler.svg)
 
-In prioritized mode the request first receives its effective queue, is then
-checked by `CommandPolicy`, and only then consumes queue capacity:
+Weighted queues rotate without starvation. Their weights describe relative
+shares only while several queues are ready. Empty queues never create an
+artificial pause. Strict queues are selected before every weighted queue;
+larger strict ranks win and equal ranks rotate fairly. Continuous strict work
+can intentionally starve weighted work, so strict priority is explicit.
 
-![HartLink prioritized queues](docs/images/priority-queues.svg)
+| Configuration | Scheduling behavior |
+|---|---|
+| one weighted queue | bounded global FIFO |
+| several queues with weight `1` | fair round-robin |
+| weights `6`, `2`, and `1` | starvation-free relative shares `6:2:1` |
+| strict rank `20` and strict rank `10` | rank `20` is drained first; equal ranks rotate |
+| strict plus weighted queues | every ready strict queue precedes weighted work |
 
-Queue scheduling changes latency distribution, not physical HART throughput.
-If either queue is empty, the other proceeds immediately without artificial
-pauses.
-
-| Preset | Service : normal | Meaning |
-|---|---:|---|
-| `QueueScheduling::EQUAL` | `1:1` | alternate while both queues have work |
-| default | `3:1` | favor service traffic without starving normal work |
-| `QueueScheduling::MAXIMUM_SERVICE` | `255:1` | strongest bounded service preference |
-| `QueueScheduling::custom(n)` | `n:1` | validated application-specific ratio |
-
-`MAXIMUM_SERVICE` remains starvation-free, but a normal request can still use
-up its own deadline while waiting behind a sustained service load. A custom
-ratio is validated explicitly:
+The following is complete Rust configuration, not YAML or pseudocode:
 
 ```rust,no_run
-use hart_link::{LinkBuilder, QueueScheduling};
+use hart_link::{LinkBuilder, QueueConfig, QueueId, QueuePriority};
 # use hart_link::emulator::MemoryChannel;
 # fn example() -> Result<(), Box<dyn std::error::Error>> {
 # let (channel, _) = MemoryChannel::try_pair(8)?;
-let scheduling = QueueScheduling::custom(4)?;
-let (_client, _runner) = LinkBuilder::new(channel)
-    .queue_scheduling(scheduling)
-    .build()?;
-# Ok(())
-# }
-```
+const CONTROL: QueueId = QueueId::new(10);
+const INTERACTIVE: QueueId = QueueId::new(20);
+const POLLING: QueueId = QueueId::new(30);
 
-Existing `with_service_weight` and `service_weight` methods remain available
-for compatibility.
-
-### Changing queue weights
-
-The `service:normal` ratio can be changed while the link is running:
-
-```rust,no_run
-# use hart_link::{LinkBuilder, QueueScheduling};
-# use hart_link::emulator::MemoryChannel;
-# fn example() -> Result<(), Box<dyn std::error::Error>> {
-# let (channel, _) = MemoryChannel::try_pair(8)?;
 let (link, _runner) = LinkBuilder::new(channel)
-    .queue_scheduling(QueueScheduling::custom(3)?)
+    .queues([
+        QueueConfig::strict(CONTROL, 32, 10)?,
+        QueueConfig::weighted(INTERACTIVE, 128, 4)?,
+        QueueConfig::weighted(POLLING, 512, 1)?,
+    ])
+    .default_queue(INTERACTIVE)
     .build()?;
 
-let ddngine = link.service();
-let instrument_inspector = link.normal();
+let control = link.queue(CONTROL)?;
+let interactive = link.queue(INTERACTIVE)?;
+let polling = link.queue(POLLING)?;
 
-link.set_service_weight(5)?; // Service:Normal = 5:1
-assert_eq!(link.service_weight(), 5);
-# let _ = (ddngine, instrument_inspector);
+// Changes are atomic, require no reconnect, and never interrupt an exchange.
+interactive.set_weight(6)?;
+polling.set_priority(QueuePriority::strict(1))?;
+
+assert_eq!(control.id(), CONTROL);
+assert_eq!(link.queue_snapshots().len(), 3);
 # Ok(())
 # }
 ```
 
-## One queue, routing, and command admission
+Each queue enforces its own capacity before accepting a request. The builder
+also validates duplicate IDs, the selected default queue, queue count,
+individual capacity, and total capacity. A `QueueClient` is permanently bound
+to its queue, so application components do not repeat a queue selector for
+every command.
 
-Applications that do not need priorities can select one bounded global FIFO.
-In this mode every caller shares the same ordering and supplied priorities are
-ignored:
+### One queue
 
-![HartLink single queue mode](docs/images/single-queue.svg)
+The default builder already creates one bounded FIFO. An explicit one-queue
+layout is useful when the application wants a different identifier or capacity:
 
 ```rust,no_run
-use hart_link::LinkBuilder;
+use hart_link::{LinkBuilder, QueueConfig, QueueId};
 # use hart_link::emulator::MemoryChannel;
 # fn example() -> Result<(), Box<dyn std::error::Error>> {
 # let (channel, _) = MemoryChannel::try_pair(8)?;
-let (_client, _runner) = LinkBuilder::new(channel)
-    .single_queue(256)
+const REQUESTS: QueueId = QueueId::new(40);
+let (link, _runner) = LinkBuilder::new(channel)
+    .queues([QueueConfig::weighted(REQUESTS, 256, 1)?])
+    .default_queue(REQUESTS)
     .build()?;
+let requests = link.queue(REQUESTS)?;
+# let _ = requests;
 # Ok(())
 # }
 ```
 
-With prioritized queues, routing runs first and admission runs second. The
-policy therefore sees the effective queue, not merely the priority requested
-by the caller. A rejected request does not consume a request identifier or any
-queue capacity and increments `LinkSnapshot::denied`:
+### Routing and command admission
+
+Routing runs before admission. The policy therefore sees the effective queue.
+A rejected request consumes neither queue capacity nor a request identifier and
+increments `LinkSnapshot::denied`:
 
 ```rust,no_run
-use hart_link::{CommandCode, CommandPolicy, CommandRouting, LinkBuilder, Priority};
+use hart_link::{CommandCode, CommandPolicy, CommandRouting, LinkBuilder, QueueConfig, QueueId};
 # use hart_link::emulator::MemoryChannel;
 # fn example() -> Result<(), Box<dyn std::error::Error>> {
 # let (channel, _) = MemoryChannel::try_pair(8)?;
-let service_commands = [CommandCode::new(0), CommandCode::new(13)];
+const DIAGNOSTICS: QueueId = QueueId::new(50);
+const GENERAL: QueueId = QueueId::new(60);
+let diagnostic_commands = [CommandCode::new(0), CommandCode::new(13)];
 let policy = CommandPolicy::retry_safe().and(CommandPolicy::queue_allowlist(
-    Priority::Service,
-    service_commands,
+    DIAGNOSTICS,
+    diagnostic_commands,
 ));
 let (_client, _runner) = LinkBuilder::new(channel)
-    .command_routing(CommandRouting::service_commands(service_commands))
+    .queues([
+        QueueConfig::weighted(DIAGNOSTICS, 64, 3)?,
+        QueueConfig::weighted(GENERAL, 256, 1)?,
+    ])
+    .default_queue(GENERAL)
+    .command_routing(CommandRouting::commands_to(DIAGNOSTICS, diagnostic_commands))
     .command_policy(policy)
     .build()?;
 # Ok(())
@@ -336,13 +343,13 @@ let (_client, _runner) = LinkBuilder::new(channel)
 ```
 
 Built-in policies include allow-all, read-only, retry-safe, command allow-list,
-command deny-list, and an allow-list for one effective priority. The read-only
+command deny-list, and an allow-list for one effective queue. The read-only
 and retry-safe policies trust only the built-in command registry: a caller
 cannot bypass them by changing `Request::retry_safety`. An unknown vendor
 command must be admitted explicitly, for example by composing a reviewed
 command allow-list with `or`. Policies can be combined with `and` or `or`;
 `CommandPolicy::custom` receives the full immutable request, both effective and
-catalog safety, and the effective priority. Admission is a local safety
+catalog safety, and the effective queue. Admission is a local safety
 boundary, not authentication or authorization of a remote user.
 
 ## Managed device health and adaptive timing

@@ -3,7 +3,7 @@ use thiserror::Error;
 use crate::{
     Address,
     operation::{CommandOutcome, DeviceIdentity, Operation, OperationError, ReadDeviceIdentity},
-    service::{ExchangeError, LinkClient, Priority, RetryPolicy},
+    service::{ExchangeError, LinkClient, QueueId, RetryPolicy},
     wire::WireError,
 };
 
@@ -59,7 +59,12 @@ impl DeviceSession {
         policy: RetryPolicy,
     ) -> Result<Self, SessionError> {
         let identity = link
-            .execute(address, &ReadDeviceIdentity, Priority::Service, policy)
+            .execute(
+                address,
+                &ReadDeviceIdentity,
+                link.default_queue_id(),
+                policy,
+            )
             .await?;
         Self::from_identity(link, address, identity)
     }
@@ -76,7 +81,9 @@ impl DeviceSession {
         }
         let operation = ReadDeviceIdentity;
         let request = operation.request(address)?.with_preambles(preambles);
-        let reply = link.request(request, Priority::Service, policy).await?;
+        let reply = link
+            .request(request, link.default_queue_id(), policy)
+            .await?;
         let identity = operation.decode_reply(&reply)?;
         Self::from_identity(link, address, identity)
     }
@@ -139,11 +146,11 @@ impl DeviceSession {
     pub async fn execute<O: crate::Operation>(
         &self,
         operation: &O,
-        priority: Priority,
+        queue: QueueId,
         policy: RetryPolicy,
     ) -> Result<O::Output, SessionError> {
         let request = self.request(operation)?;
-        let reply = self.link.request(request, priority, policy).await?;
+        let reply = self.link.request(request, queue, policy).await?;
         operation.decode_reply(&reply).map_err(SessionError::from)
     }
 
@@ -162,11 +169,11 @@ impl DeviceSession {
         &self,
         operation: &O,
         accepted_warnings: &[u8],
-        priority: Priority,
+        queue: QueueId,
         policy: RetryPolicy,
     ) -> Result<CommandOutcome<O::Output>, SessionError> {
         let request = self.request(operation)?;
-        let reply = self.link.request(request, priority, policy).await?;
+        let reply = self.link.request(request, queue, policy).await?;
         operation
             .decode_reply_accepting(&reply, accepted_warnings)
             .map_err(SessionError::from)

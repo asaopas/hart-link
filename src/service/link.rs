@@ -1,17 +1,16 @@
 use std::{
     collections::BTreeSet,
     fmt,
-    num::NonZeroU8,
     sync::{
         Arc,
-        atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
     time::Duration,
 };
 
 use thiserror::Error;
 use tokio::{
-    sync::{broadcast, mpsc, oneshot},
+    sync::{broadcast, oneshot},
     time::{Instant, timeout_at},
 };
 
@@ -19,15 +18,16 @@ use crate::{
     catalog::{OperationSafety, command_descriptor},
     channel::{ByteChannel, ChannelError},
     operation::{CommandCode, CommandOutcome, DeviceReply, Operation, OperationError, Request},
-    service::BurstHub,
+    service::{
+        BurstHub, QueueConfig, QueueConfigError, QueueError, QueueId, QueuePriority, QueueSnapshot,
+        queue_set::{QueueCursor, QueueEntry, QueuePushError, QueueSet, validate_layout},
+    },
     wire::{
         ChecksumPolicy, DecodeEvent, DecodeLimits, Frame, FrameDecoder, FrameKind,
         MAX_ENCODED_FRAME_SIZE, MAXIMUM_DECODE_BUFFER_CAPACITY, WireError,
     },
 };
 
-/// Largest accepted capacity of either priority queue.
-pub const MAXIMUM_LINK_QUEUE_CAPACITY: usize = 1_048_576;
 /// Largest transport-read allocation accepted by validated construction.
 pub const MAXIMUM_LINK_READ_BUFFER: usize = 1_048_576;
 /// Largest retained streaming-decoder tail accepted by validated construction.
@@ -43,25 +43,6 @@ pub const MAXIMUM_LATE_RESPONSE_GUARD: Duration = Duration::from_mins(1);
 /// Hard upper bound for any per-request timeout or retry delay.
 pub const MAXIMUM_RETRY_DURATION: Duration = Duration::from_hours(24);
 
-/// Request priority within one physical link.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Priority {
-    /// System operation that manages a connection or session.
-    Service,
-    /// Ordinary application operation.
-    Normal,
-}
-
-/// Queue topology selected when the link is built.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum QueueMode {
-    /// Independent service and normal queues with weighted scheduling.
-    #[default]
-    Prioritized,
-    /// One global FIFO queue; caller-supplied priorities are intentionally ignored.
-    SingleFifo,
-}
-
 /// Immutable command information supplied to a custom admission policy.
 #[derive(Debug, Clone, Copy)]
 pub struct CommandContext<'a> {
@@ -71,12 +52,12 @@ pub struct CommandContext<'a> {
     pub safety: OperationSafety,
     /// Safety from the built-in registry, or `None` for an unknown command.
     pub catalog_safety: Option<OperationSafety>,
-    /// Effective priority after applying the queue mode.
-    pub priority: Priority,
+    /// Queue selected after command routing.
+    pub queue: QueueId,
 }
 
 type CommandGuard = dyn for<'a> Fn(CommandContext<'a>) -> bool + Send + Sync + 'static;
-type CommandRouter = dyn for<'a> Fn(CommandContext<'a>) -> Priority + Send + Sync + 'static;
+type CommandRouter = dyn for<'a> Fn(CommandContext<'a>) -> QueueId + Send + Sync + 'static;
 
 /// Cloneable admission policy evaluated before a request occupies queue capacity.
 #[derive(Clone)]
@@ -142,17 +123,17 @@ impl CommandPolicy {
         })
     }
 
-    /// Restricts one effective priority to an allow-list and leaves the other priority open.
+    /// Restricts one effective queue to an allow-list and leaves every other queue open.
     ///
     /// Routing is evaluated first, so the policy observes the queue that will actually receive
-    /// the request. In [`QueueMode::SingleFifo`] every request has normal priority.
+    /// the request.
     pub fn queue_allowlist(
-        priority: Priority,
+        queue: QueueId,
         commands: impl IntoIterator<Item = CommandCode>,
     ) -> Self {
         let commands = commands.into_iter().collect::<BTreeSet<_>>();
         Self::custom_named("queue-allow-list", move |context| {
-            context.priority != priority || commands.contains(&context.request.command)
+            context.queue != queue || commands.contains(&context.request.command)
         })
     }
 
@@ -215,33 +196,33 @@ impl Default for CommandRouting {
 }
 
 impl CommandRouting {
-    /// Preserves the priority supplied by the caller.
+    /// Preserves the queue supplied by the caller.
     pub fn preserve_requested() -> Self {
-        Self::custom_named("preserve-requested", |context| context.priority)
+        Self::custom_named("preserve-requested", |context| context.queue)
     }
 
-    /// Routes listed commands to service and every other command to normal.
-    pub fn service_commands(commands: impl IntoIterator<Item = CommandCode>) -> Self {
+    /// Routes listed commands to one queue and leaves every other request in its selected queue.
+    pub fn commands_to(queue: QueueId, commands: impl IntoIterator<Item = CommandCode>) -> Self {
         let commands = commands.into_iter().collect::<BTreeSet<_>>();
-        Self::custom_named("service-command-list", move |context| {
+        Self::custom_named("command-list", move |context| {
             if commands.contains(&context.request.command) {
-                Priority::Service
+                queue
             } else {
-                Priority::Normal
+                context.queue
             }
         })
     }
 
     /// Creates application-defined routing from immutable request information.
     pub fn custom(
-        router: impl for<'a> Fn(CommandContext<'a>) -> Priority + Send + Sync + 'static,
+        router: impl for<'a> Fn(CommandContext<'a>) -> QueueId + Send + Sync + 'static,
     ) -> Self {
         Self::custom_named("custom", router)
     }
 
     fn custom_named(
         name: &'static str,
-        router: impl for<'a> Fn(CommandContext<'a>) -> Priority + Send + Sync + 'static,
+        router: impl for<'a> Fn(CommandContext<'a>) -> QueueId + Send + Sync + 'static,
     ) -> Self {
         Self {
             router: Arc::new(router),
@@ -249,86 +230,9 @@ impl CommandRouting {
         }
     }
 
-    fn route(&self, context: CommandContext<'_>) -> Priority {
+    fn route(&self, context: CommandContext<'_>) -> QueueId {
         (self.router)(context)
     }
-}
-
-/// Starvation-free scheduling preset for the two link queues.
-///
-/// The selected value becomes the initial atomic service quota and can later be
-/// replaced through [`LinkClient::set_queue_scheduling`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct QueueScheduling {
-    service_weight: NonZeroU8,
-}
-
-impl QueueScheduling {
-    /// Equal service:normal rotation while both queues contain work.
-    pub const EQUAL: Self = Self {
-        service_weight: NonZeroU8::MIN,
-    };
-
-    /// Strongest starvation-free service preference: at most 255:1.
-    ///
-    /// This preset is intended for short emergency bursts. A continuously full
-    /// service queue can still delay normal work long enough to exhaust its deadline.
-    pub const MAXIMUM_SERVICE: Self = Self {
-        service_weight: NonZeroU8::MAX,
-    };
-
-    /// Creates a custom `service:normal` ratio of `service_weight:1`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`QueueSchedulingError::Zero`] when the service quota is zero.
-    pub const fn custom(service_weight: u8) -> Result<Self, QueueSchedulingError> {
-        match NonZeroU8::new(service_weight) {
-            Some(service_weight) => Ok(Self { service_weight }),
-            None => Err(QueueSchedulingError::Zero),
-        }
-    }
-
-    /// Returns the maximum consecutive service operations while normal work is pending.
-    pub const fn service_weight(self) -> u8 {
-        self.service_weight.get()
-    }
-}
-
-impl Default for QueueScheduling {
-    fn default() -> Self {
-        Self::custom(3).unwrap_or(Self::EQUAL)
-    }
-}
-
-#[derive(Debug)]
-struct QueueSchedulerControl {
-    service_weight: AtomicU8,
-}
-
-impl QueueSchedulerControl {
-    const fn new(service_weight: u8) -> Self {
-        Self {
-            service_weight: AtomicU8::new(service_weight),
-        }
-    }
-
-    fn service_weight(&self) -> u8 {
-        self.service_weight.load(Ordering::Acquire)
-    }
-
-    fn set_service_weight(&self, service_weight: NonZeroU8) {
-        self.service_weight
-            .store(service_weight.get(), Ordering::Release);
-    }
-}
-
-/// Invalid queue-scheduling preset.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
-pub enum QueueSchedulingError {
-    /// A zero service quota would prevent weighted scheduling from making progress.
-    #[error("custom queue scheduling requires a nonzero service weight")]
-    Zero,
 }
 
 /// Independent retry limits for one exchange.
@@ -476,15 +380,11 @@ pub enum RetryPolicyError {
     RetryDelayLimit,
 }
 
-/// Settings for one queue and its streaming decoder.
+/// Baseline settings for the default queue and streaming decoder.
 #[derive(Debug, Clone, Copy)]
 pub struct LinkConfig {
-    /// System-queue capacity.
-    pub service_capacity: usize,
-    /// Common-queue capacity.
-    pub normal_capacity: usize,
-    /// Maximum consecutive system operations while common work is pending.
-    pub service_weight: u8,
+    /// Capacity used by the default one-queue layout.
+    pub queue_capacity: usize,
     /// Maximum transport-read chunk.
     pub read_buffer_size: usize,
     /// Streaming-decoder limits.
@@ -494,9 +394,7 @@ pub struct LinkConfig {
 impl Default for LinkConfig {
     fn default() -> Self {
         Self {
-            service_capacity: 32,
-            normal_capacity: 256,
-            service_weight: 3,
+            queue_capacity: 256,
             read_buffer_size: 512,
             decoder: DecodeLimits::default(),
         }
@@ -506,20 +404,11 @@ impl Default for LinkConfig {
 impl LinkConfig {
     /// Verifies that every capacity and decoder limit is explicit and usable.
     pub const fn validate(&self) -> Result<(), LinkConfigError> {
-        if self.service_capacity == 0 {
-            return Err(LinkConfigError::ServiceCapacity);
+        if self.queue_capacity == 0 {
+            return Err(LinkConfigError::QueueCapacity);
         }
-        if self.normal_capacity == 0 {
-            return Err(LinkConfigError::NormalCapacity);
-        }
-        if self.service_capacity > MAXIMUM_LINK_QUEUE_CAPACITY {
-            return Err(LinkConfigError::ServiceCapacityLimit(self.service_capacity));
-        }
-        if self.normal_capacity > MAXIMUM_LINK_QUEUE_CAPACITY {
-            return Err(LinkConfigError::NormalCapacityLimit(self.normal_capacity));
-        }
-        if self.service_weight == 0 {
-            return Err(LinkConfigError::ServiceWeight);
+        if self.queue_capacity > super::MAXIMUM_QUEUE_CAPACITY {
+            return Err(LinkConfigError::QueueCapacityLimit(self.queue_capacity));
         }
         if self.read_buffer_size == 0 {
             return Err(LinkConfigError::ReadBufferSize);
@@ -557,22 +446,9 @@ impl LinkConfig {
         Ok(())
     }
 
-    /// Sets the independent service and normal queue capacities.
-    pub const fn with_queue_capacities(mut self, service: usize, normal: usize) -> Self {
-        self.service_capacity = service;
-        self.normal_capacity = normal;
-        self
-    }
-
-    /// Sets the weighted-fair service quota.
-    pub const fn with_service_weight(mut self, weight: u8) -> Self {
-        self.service_weight = weight;
-        self
-    }
-
-    /// Applies a validated queue-scheduling preset.
-    pub const fn with_queue_scheduling(mut self, scheduling: QueueScheduling) -> Self {
-        self.service_weight = scheduling.service_weight();
+    /// Sets the capacity used by the default one-queue layout.
+    pub const fn with_queue_capacity(mut self, capacity: usize) -> Self {
+        self.queue_capacity = capacity;
         self
     }
 
@@ -592,21 +468,12 @@ impl LinkConfig {
 /// Invalid queue or streaming-decoder configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum LinkConfigError {
-    /// The service queue cannot have zero capacity.
-    #[error("service_capacity must be greater than zero")]
-    ServiceCapacity,
-    /// The normal queue cannot have zero capacity.
-    #[error("normal_capacity must be greater than zero")]
-    NormalCapacity,
-    /// A service queue is implausibly large and could exhaust runtime resources.
-    #[error("service_capacity {0} exceeds the supported limit")]
-    ServiceCapacityLimit(usize),
-    /// A normal queue is implausibly large and could exhaust runtime resources.
-    #[error("normal_capacity {0} exceeds the supported limit")]
-    NormalCapacityLimit(usize),
-    /// Fair scheduling requires a nonzero service weight.
-    #[error("service_weight must be greater than zero")]
-    ServiceWeight,
+    /// The default queue cannot have zero capacity.
+    #[error("queue_capacity must be greater than zero")]
+    QueueCapacity,
+    /// The default queue is implausibly large and could exhaust runtime resources.
+    #[error("queue_capacity {0} exceeds the supported limit")]
+    QueueCapacityLimit(usize),
     /// A transport read must have at least one output byte.
     #[error("read_buffer_size must be greater than zero")]
     ReadBufferSize,
@@ -641,6 +508,9 @@ pub enum LinkBuildError {
     /// Queue or decoder configuration is invalid.
     #[error(transparent)]
     Config(#[from] LinkConfigError),
+    /// The queue layout is empty, ambiguous, or exceeds a safety bound.
+    #[error(transparent)]
+    Queues(#[from] QueueConfigError),
     /// Default retry configuration is invalid.
     #[error(transparent)]
     RetryPolicy(#[from] RetryPolicyError),
@@ -664,8 +534,8 @@ pub enum LinkEvent {
         id: u64,
         /// Logical command number.
         command: CommandCode,
-        /// Priority.
-        priority: Priority,
+        /// Queue selected after routing.
+        queue: QueueId,
     },
     /// A request was rejected by admission control before receiving an identifier.
     Denied {
@@ -673,8 +543,8 @@ pub enum LinkEvent {
         command: u16,
         /// Resolved retry-safety classification.
         safety: OperationSafety,
-        /// Effective priority after command routing.
-        priority: Priority,
+        /// Queue selected after command routing.
+        queue: QueueId,
     },
     /// The runner started an exchange.
     Started {
@@ -765,10 +635,8 @@ pub enum RetryCause {
 /// State snapshot obtained without locking the queue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LinkSnapshot {
-    /// Number of pending system requests.
-    pub queued_service: usize,
-    /// Number of pending common requests.
-    pub queued_normal: usize,
+    /// Number of pending requests across every configured queue.
+    pub queued: usize,
     /// Total number of physical exchanges started after read-only coalescing.
     pub started: u64,
     /// Total number of successful requests.
@@ -785,8 +653,6 @@ pub struct LinkSnapshot {
 
 #[derive(Debug, Default)]
 struct Counters {
-    queued_service: AtomicUsize,
-    queued_normal: AtomicUsize,
     started: AtomicU64,
     completed: AtomicU64,
     failed: AtomicU64,
@@ -801,16 +667,19 @@ struct Counters {
 pub enum StartError {
     /// The configured command policy rejected the request before enqueueing.
     #[error(
-        "command {command} with safety {safety:?} is denied for the {priority:?} queue by the admission policy"
+        "command {command} with safety {safety:?} is denied for queue {queue} by the admission policy"
     )]
     CommandDenied {
         /// Rejected logical command number.
         command: u16,
         /// Resolved retry-safety classification.
         safety: OperationSafety,
-        /// Effective priority after command routing.
-        priority: Priority,
+        /// Queue selected after command routing.
+        queue: QueueId,
     },
+    /// The selected queue is not part of this link.
+    #[error("queue {0} is not configured on this link")]
+    UnknownQueue(QueueId),
     /// The selected queue is full.
     #[error("queue is full")]
     Full,
@@ -836,16 +705,19 @@ pub enum StartError {
 pub enum ExchangeError {
     /// The configured command policy rejected the request before enqueueing.
     #[error(
-        "command {command} with safety {safety:?} is denied for the {priority:?} queue by the admission policy"
+        "command {command} with safety {safety:?} is denied for queue {queue} by the admission policy"
     )]
     CommandDenied {
         /// Rejected logical command number.
         command: u16,
         /// Resolved retry-safety classification.
         safety: OperationSafety,
-        /// Effective priority after command routing.
-        priority: Priority,
+        /// Queue selected after command routing.
+        queue: QueueId,
     },
+    /// The selected queue is not part of this link.
+    #[error("queue {0} is not configured on this link")]
+    UnknownQueue(QueueId),
     /// The request did not complete before its end-to-end deadline.
     #[error("request deadline expired")]
     Deadline,
@@ -890,11 +762,6 @@ struct Job {
     reply: Option<oneshot::Sender<Result<DeviceReply, ExchangeError>>>,
 }
 
-enum IdleSelection {
-    Job(Priority, Job),
-    Input(Result<usize, ChannelError>),
-}
-
 /// Cancelable wait for an enqueued request.
 #[derive(Debug)]
 pub struct PendingReply {
@@ -916,70 +783,99 @@ impl PendingReply {
     }
 }
 
-/// Cloneable entry point to one link queue.
-#[derive(Debug, Clone)]
+struct ClientLifetime {
+    queues: Arc<QueueSet<Job>>,
+}
+
+impl Drop for ClientLifetime {
+    fn drop(&mut self) {
+        self.queues.close_input();
+    }
+}
+
+/// Cloneable entry point to all configured queues of one physical link.
+#[derive(Clone)]
 pub struct LinkClient {
-    service_tx: mpsc::Sender<Job>,
-    normal_tx: mpsc::Sender<Job>,
+    queues: Arc<QueueSet<Job>>,
+    _lifetime: Arc<ClientLifetime>,
     events: broadcast::Sender<LinkEvent>,
     counters: Arc<Counters>,
-    default_priority: Priority,
+    default_queue: QueueId,
     default_retry: RetryPolicy,
-    queue_mode: QueueMode,
     command_policy: CommandPolicy,
     command_routing: CommandRouting,
-    scheduler: Arc<QueueSchedulerControl>,
+}
+
+impl fmt::Debug for LinkClient {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LinkClient")
+            .field("default_queue", &self.default_queue)
+            .field("default_retry", &self.default_retry)
+            .field("queues", &self.queues.snapshots())
+            .finish_non_exhaustive()
+    }
 }
 
 impl LinkClient {
-    /// Returns the currently active `service:normal` ratio as `N:1`.
-    pub fn service_weight(&self) -> u8 {
-        self.scheduler.service_weight()
+    /// Returns a cloneable handle permanently bound to one configured queue.
+    pub fn queue(&self, queue: QueueId) -> Result<QueueClient, QueueError> {
+        if !self.queues.contains(queue) {
+            return Err(QueueError::Unknown(queue));
+        }
+        Ok(QueueClient::new(self.clone(), queue))
     }
 
-    /// Changes the service quota atomically without reconnecting the channel.
-    ///
-    /// An in-flight exchange is never interrupted. The new value is observed at
-    /// the next queue selection, and normal work remains starvation-free.
-    pub fn set_service_weight(&self, service_weight: u8) -> Result<(), QueueSchedulingError> {
-        let scheduling = QueueScheduling::custom(service_weight)?;
-        self.set_queue_scheduling(scheduling);
-        Ok(())
+    /// Returns a handle bound to the queue selected as the link default.
+    pub fn default_queue(&self) -> QueueClient {
+        QueueClient::new(self.clone(), self.default_queue)
     }
 
-    /// Applies a validated scheduling preset atomically.
-    pub fn set_queue_scheduling(&self, scheduling: QueueScheduling) {
-        self.scheduler.set_service_weight(scheduling.service_weight);
+    /// Returns the default queue identifier.
+    pub const fn default_queue_id(&self) -> QueueId {
+        self.default_queue
     }
 
-    /// Returns the priority selected for convenience operations.
-    pub const fn default_priority(&self) -> Priority {
-        self.default_priority
-    }
-
-    /// Returns the retry policy selected for convenience operations.
+    /// Returns the retry policy used by convenience operations.
     pub const fn default_retry(&self) -> RetryPolicy {
         self.default_retry
     }
 
-    /// Returns whether requests use two priority queues or one global FIFO.
-    pub const fn queue_mode(&self) -> QueueMode {
-        self.queue_mode
+    /// Returns one queue's current scheduling policy.
+    pub fn queue_priority(&self, queue: QueueId) -> Result<QueuePriority, QueueError> {
+        self.queues.priority(queue)
     }
 
-    /// Returns a cloneable view that always requests service priority.
-    pub fn service(&self) -> PriorityClient {
-        PriorityClient::new(self.clone(), Priority::Service)
+    /// Atomically changes one queue's scheduling policy.
+    ///
+    /// The in-flight exchange is not interrupted. The next scheduling decision observes the
+    /// new policy. Strict priority is intentionally allowed to starve weighted queues.
+    pub fn set_queue_priority(
+        &self,
+        queue: QueueId,
+        priority: QueuePriority,
+    ) -> Result<(), QueueError> {
+        self.queues.set_priority(queue, priority)
     }
 
-    /// Returns a cloneable view that always requests normal priority.
-    pub fn normal(&self) -> PriorityClient {
-        PriorityClient::new(self.clone(), Priority::Normal)
+    /// Atomically assigns a starvation-free weighted quota to one queue.
+    pub fn set_queue_weight(&self, queue: QueueId, weight: u16) -> Result<(), QueueError> {
+        self.queues.set_weight(queue, weight)
     }
 
-    /// Enqueues a request using the defaults selected when the link was built.
+    /// Returns one independently bounded queue snapshot.
+    pub fn queue_snapshot(&self, queue: QueueId) -> Result<QueueSnapshot, QueueError> {
+        self.queues.snapshot(queue)
+    }
+
+    /// Returns snapshots for every configured queue in scheduling order.
+    pub fn queue_snapshots(&self) -> Vec<QueueSnapshot> {
+        self.queues.snapshots()
+    }
+
+    /// Enqueues a request into the default queue.
     pub async fn start_default(&self, request: Request) -> Result<PendingReply, StartError> {
-        self.start(request, self.default_priority, self.default_retry)
+        self.start(request, self.default_queue, self.default_retry)
             .await
     }
 
@@ -987,98 +883,75 @@ impl LinkClient {
     pub async fn start(
         &self,
         request: Request,
-        priority: Priority,
+        queue: QueueId,
         policy: RetryPolicy,
     ) -> Result<PendingReply, StartError> {
-        self.start_with_prefix(request, Vec::new(), priority, policy)
+        self.start_with_prefix(request, Vec::new(), queue, policy)
             .await
     }
 
-    /// Enqueues a request with bytes that must be transmitted immediately before its frame.
-    ///
-    /// This is intended for explicit gateway or modem wake-up sequences. The prefix remains
-    /// part of the same serialized exchange and is repeated with a permitted transport retry.
+    /// Enqueues a request with bytes transmitted immediately before its HART frame.
     pub async fn start_with_prefix(
         &self,
         request: Request,
         transmit_prefix: Vec<u8>,
-        priority: Priority,
+        queue: QueueId,
         policy: RetryPolicy,
     ) -> Result<PendingReply, StartError> {
-        let priority = self.resolve_priority(&request, priority);
-        let job = self.make_job(request, transmit_prefix, priority, policy)?;
-        let id = job.0.id;
-        let command = job.0.request.command;
-        let receiver = job.1;
-        if Instant::now() >= job.0.deadline {
-            return Err(StartError::Deadline);
-        }
-        let permit = timeout_at(job.0.deadline, self.sender(priority).reserve())
+        let queue = self.resolve_queue(&request, queue)?;
+        let (job, receiver) = self.make_job(request, transmit_prefix, queue, policy)?;
+        let id = job.id;
+        let command = job.request.command;
+        let deadline = job.deadline;
+        self.queues
+            .push(queue, job, deadline)
             .await
-            .map_err(|_| StartError::Deadline)?
-            .map_err(|_| StartError::Closed)?;
-        self.increment_queue(priority);
-        let _ = self.events.send(LinkEvent::Queued {
-            id,
-            command,
-            priority,
-        });
-        permit.send(job.0);
+            .map_err(map_queue_push_error)?;
+        let _ = self.events.send(LinkEvent::Queued { id, command, queue });
         Ok(PendingReply { id, receiver })
     }
 
-    /// Attempts to enqueue a request without waiting for capacity.
+    /// Attempts to enqueue without waiting for queue capacity.
     pub fn try_start(
         &self,
         request: Request,
-        priority: Priority,
+        queue: QueueId,
         policy: RetryPolicy,
     ) -> Result<PendingReply, StartError> {
-        let priority = self.resolve_priority(&request, priority);
-        let job = self.make_job(request, Vec::new(), priority, policy)?;
-        let id = job.0.id;
-        let command = job.0.request.command;
-        let receiver = job.1;
-        let permit = self
-            .sender(priority)
-            .try_reserve()
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(()) => StartError::Full,
-                mpsc::error::TrySendError::Closed(()) => StartError::Closed,
-            })?;
-        self.increment_queue(priority);
-        let _ = self.events.send(LinkEvent::Queued {
-            id,
-            command,
-            priority,
-        });
-        permit.send(job.0);
+        let queue = self.resolve_queue(&request, queue)?;
+        let (job, receiver) = self.make_job(request, Vec::new(), queue, policy)?;
+        let id = job.id;
+        let command = job.request.command;
+        self.queues
+            .try_push(queue, job)
+            .map_err(map_queue_push_error)?;
+        let _ = self.events.send(LinkEvent::Queued { id, command, queue });
         Ok(PendingReply { id, receiver })
     }
 
-    /// Attempts to enqueue a request immediately using the configured defaults.
+    /// Attempts to enqueue immediately using the configured defaults.
     pub fn try_start_default(&self, request: Request) -> Result<PendingReply, StartError> {
-        self.try_start(request, self.default_priority, self.default_retry)
+        self.try_start(request, self.default_queue, self.default_retry)
     }
 
-    /// Executes a complete request.
+    /// Executes a complete request through the selected queue.
     pub async fn request(
         &self,
         request: Request,
-        priority: Priority,
+        queue: QueueId,
         policy: RetryPolicy,
     ) -> Result<DeviceReply, ExchangeError> {
-        self.request_with_prefix(request, Vec::new(), priority, policy)
+        self.request_with_prefix(request, Vec::new(), queue, policy)
             .await
     }
 
-    /// Executes a request using the defaults selected when the link was built.
+    /// Executes a request through the default queue.
     pub async fn request_default(&self, request: Request) -> Result<DeviceReply, ExchangeError> {
-        self.request(request, self.default_priority, self.default_retry)
+        self.request(request, self.default_queue, self.default_retry)
             .await
     }
 
-    /// Executes a prefixed request using the configured defaults.
+    /// Executes a prefixed request through the default queue.
     pub async fn request_default_with_prefix(
         &self,
         request: Request,
@@ -1087,7 +960,7 @@ impl LinkClient {
         self.request_with_prefix(
             request,
             transmit_prefix,
-            self.default_priority,
+            self.default_queue,
             self.default_retry,
         )
         .await
@@ -1098,70 +971,50 @@ impl LinkClient {
         &self,
         request: Request,
         transmit_prefix: Vec<u8>,
-        priority: Priority,
+        queue: QueueId,
         policy: RetryPolicy,
     ) -> Result<DeviceReply, ExchangeError> {
-        self.start_with_prefix(request, transmit_prefix, priority, policy)
+        self.start_with_prefix(request, transmit_prefix, queue, policy)
             .await
-            .map_err(|error| match error {
-                StartError::CommandDenied {
-                    command,
-                    safety,
-                    priority,
-                } => ExchangeError::CommandDenied {
-                    command,
-                    safety,
-                    priority,
-                },
-                StartError::Deadline => ExchangeError::Deadline,
-                StartError::RetryPolicy(error) => ExchangeError::RetryPolicy(error),
-                StartError::Operation(error) => ExchangeError::Operation(error),
-                StartError::TransmitPrefix(length) => ExchangeError::TransmitPrefix(length),
-                StartError::Closed | StartError::Full => ExchangeError::RunnerStopped,
-            })?
+            .map_err(start_to_exchange_error)?
             .wait()
             .await
     }
 
-    /// Executes a typed operation and decodes its result.
+    /// Executes and decodes a typed operation through the selected queue.
     pub async fn execute<O: Operation>(
         &self,
         address: crate::Address,
         operation: &O,
-        priority: Priority,
+        queue: QueueId,
         policy: RetryPolicy,
     ) -> Result<O::Output, ExchangeError> {
         let request = operation.request(address)?;
-        let reply = self.request(request, priority, policy).await?;
+        let reply = self.request(request, queue, policy).await?;
         operation.decode_reply(&reply).map_err(ExchangeError::from)
     }
 
-    /// Executes a typed operation using the configured priority and retry defaults.
+    /// Executes a typed operation using the configured defaults.
     pub async fn execute_default<O: Operation>(
         &self,
         address: crate::Address,
         operation: &O,
     ) -> Result<O::Output, ExchangeError> {
-        self.execute(
-            address,
-            operation,
-            self.default_priority,
-            self.default_retry,
-        )
-        .await
+        self.execute(address, operation, self.default_queue, self.default_retry)
+            .await
     }
 
-    /// Executes a typed operation while accepting only explicitly listed warning codes.
+    /// Executes a typed operation while accepting explicitly listed warning codes.
     pub async fn execute_accepting<O: Operation>(
         &self,
         address: crate::Address,
         operation: &O,
         accepted_warnings: &[u8],
-        priority: Priority,
+        queue: QueueId,
         policy: RetryPolicy,
     ) -> Result<CommandOutcome<O::Output>, ExchangeError> {
         let request = operation.request(address)?;
-        let reply = self.request(request, priority, policy).await?;
+        let reply = self.request(request, queue, policy).await?;
         operation
             .decode_reply_accepting(&reply, accepted_warnings)
             .map_err(ExchangeError::from)
@@ -1178,22 +1031,21 @@ impl LinkClient {
             address,
             operation,
             accepted_warnings,
-            self.default_priority,
+            self.default_queue,
             self.default_retry,
         )
         .await
     }
 
-    /// Subscribes an observer to events without affecting the queue.
+    /// Subscribes an observer to events without affecting scheduling.
     pub fn subscribe(&self) -> broadcast::Receiver<LinkEvent> {
         self.events.subscribe()
     }
 
-    /// Returns an instantaneous counter snapshot.
+    /// Returns aggregate counters without locking the physical channel.
     pub fn snapshot(&self) -> LinkSnapshot {
         LinkSnapshot {
-            queued_service: self.counters.queued_service.load(Ordering::Relaxed),
-            queued_normal: self.counters.queued_normal.load(Ordering::Relaxed),
+            queued: self.queues.pending_total(),
             started: self.counters.started.load(Ordering::Relaxed),
             completed: self.counters.completed.load(Ordering::Relaxed),
             failed: self.counters.failed.load(Ordering::Relaxed),
@@ -1207,7 +1059,7 @@ impl LinkClient {
         &self,
         request: Request,
         transmit_prefix: Vec<u8>,
-        priority: Priority,
+        queue: QueueId,
         policy: RetryPolicy,
     ) -> Result<(Job, oneshot::Receiver<Result<DeviceReply, ExchangeError>>), StartError> {
         policy.validate_runtime()?;
@@ -1217,18 +1069,18 @@ impl LinkClient {
             request: &request,
             safety,
             catalog_safety: catalog_safety(&request),
-            priority,
+            queue,
         }) {
             self.counters.denied.fetch_add(1, Ordering::Relaxed);
             let _ = self.events.send(LinkEvent::Denied {
                 command: request.command.get(),
                 safety,
-                priority,
+                queue,
             });
             return Err(StartError::CommandDenied {
                 command: request.command.get(),
                 safety,
-                priority,
+                queue,
             });
         }
         if transmit_prefix.len() > MAXIMUM_TRANSMIT_PREFIX {
@@ -1256,48 +1108,67 @@ impl LinkClient {
         ))
     }
 
-    fn resolve_priority(&self, request: &Request, requested: Priority) -> Priority {
-        if self.queue_mode == QueueMode::SingleFifo {
-            return Priority::Normal;
+    fn resolve_queue(&self, request: &Request, requested: QueueId) -> Result<QueueId, StartError> {
+        if !self.queues.contains(requested) {
+            return Err(StartError::UnknownQueue(requested));
         }
-        self.command_routing.route(CommandContext {
+        let queue = self.command_routing.route(CommandContext {
             request,
             safety: resolved_safety(request),
             catalog_safety: catalog_safety(request),
-            priority: requested,
-        })
-    }
-
-    const fn sender(&self, priority: Priority) -> &mpsc::Sender<Job> {
-        match priority {
-            Priority::Service => &self.service_tx,
-            Priority::Normal => &self.normal_tx,
+            queue: requested,
+        });
+        if !self.queues.contains(queue) {
+            return Err(StartError::UnknownQueue(queue));
         }
-    }
-
-    fn increment_queue(&self, priority: Priority) {
-        match priority {
-            Priority::Service => self.counters.queued_service.fetch_add(1, Ordering::Relaxed),
-            Priority::Normal => self.counters.queued_normal.fetch_add(1, Ordering::Relaxed),
-        };
+        Ok(queue)
     }
 }
 
-/// Cloneable queue view with a caller-selected default priority.
+fn map_queue_push_error(error: QueuePushError) -> StartError {
+    match error {
+        QueuePushError::Full => StartError::Full,
+        QueuePushError::Closed => StartError::Closed,
+        QueuePushError::Deadline => StartError::Deadline,
+        QueuePushError::Unknown(queue) => StartError::UnknownQueue(queue),
+    }
+}
+
+fn start_to_exchange_error(error: StartError) -> ExchangeError {
+    match error {
+        StartError::CommandDenied {
+            command,
+            safety,
+            queue,
+        } => ExchangeError::CommandDenied {
+            command,
+            safety,
+            queue,
+        },
+        StartError::UnknownQueue(queue) => ExchangeError::UnknownQueue(queue),
+        StartError::Deadline => ExchangeError::Deadline,
+        StartError::RetryPolicy(error) => ExchangeError::RetryPolicy(error),
+        StartError::Operation(error) => ExchangeError::Operation(error),
+        StartError::TransmitPrefix(length) => ExchangeError::TransmitPrefix(length),
+        StartError::Closed | StartError::Full => ExchangeError::RunnerStopped,
+    }
+}
+
+/// Cloneable handle permanently bound to one configured queue.
 #[derive(Debug, Clone)]
-pub struct PriorityClient {
+pub struct QueueClient {
     link: LinkClient,
-    priority: Priority,
+    queue: QueueId,
 }
 
-impl PriorityClient {
-    fn new(link: LinkClient, priority: Priority) -> Self {
-        Self { link, priority }
+impl QueueClient {
+    fn new(link: LinkClient, queue: QueueId) -> Self {
+        Self { link, queue }
     }
 
-    /// Returns the requested priority before optional routing and FIFO normalization.
-    pub const fn priority(&self) -> Priority {
-        self.priority
+    /// Returns this handle's queue identifier.
+    pub const fn id(&self) -> QueueId {
+        self.queue
     }
 
     /// Returns the underlying shared link client.
@@ -1305,34 +1176,51 @@ impl PriorityClient {
         &self.link
     }
 
-    /// Enqueues with the view's priority and an explicit retry policy.
+    /// Returns this queue's live state.
+    pub fn snapshot(&self) -> QueueSnapshot {
+        self.link
+            .queue_snapshot(self.queue)
+            .expect("QueueClient is only created for configured queues")
+    }
+
+    /// Atomically replaces this queue's scheduling policy.
+    pub fn set_priority(&self, priority: QueuePriority) -> Result<(), QueueError> {
+        self.link.set_queue_priority(self.queue, priority)
+    }
+
+    /// Atomically moves this queue into starvation-free weighted scheduling.
+    pub fn set_weight(&self, weight: u16) -> Result<(), QueueError> {
+        self.link.set_queue_weight(self.queue, weight)
+    }
+
+    /// Enqueues with an explicit retry policy.
     pub async fn start(
         &self,
         request: Request,
         policy: RetryPolicy,
     ) -> Result<PendingReply, StartError> {
-        self.link.start(request, self.priority, policy).await
+        self.link.start(request, self.queue, policy).await
     }
 
-    /// Enqueues immediately with the view's priority.
+    /// Enqueues immediately without waiting for capacity.
     pub fn try_start(
         &self,
         request: Request,
         policy: RetryPolicy,
     ) -> Result<PendingReply, StartError> {
-        self.link.try_start(request, self.priority, policy)
+        self.link.try_start(request, self.queue, policy)
     }
 
-    /// Executes a request with the view's priority and an explicit retry policy.
+    /// Executes a request with an explicit retry policy.
     pub async fn request(
         &self,
         request: Request,
         policy: RetryPolicy,
     ) -> Result<DeviceReply, ExchangeError> {
-        self.link.request(request, self.priority, policy).await
+        self.link.request(request, self.queue, policy).await
     }
 
-    /// Executes a request with the view's priority and the link's default retry policy.
+    /// Executes a request with the link's default retry policy.
     pub async fn request_default(&self, request: Request) -> Result<DeviceReply, ExchangeError> {
         self.request(request, self.link.default_retry()).await
     }
@@ -1345,7 +1233,7 @@ impl PriorityClient {
         policy: RetryPolicy,
     ) -> Result<O::Output, ExchangeError> {
         self.link
-            .execute(address, operation, self.priority, policy)
+            .execute(address, operation, self.queue, policy)
             .await
     }
 
@@ -1363,17 +1251,13 @@ impl PriorityClient {
 /// Sole owner of the physical channel and link decoder.
 pub struct LinkRunner<C> {
     channel: C,
-    service_rx: mpsc::Receiver<Job>,
-    normal_rx: mpsc::Receiver<Job>,
+    queues: Arc<QueueSet<Job>>,
     events: broadcast::Sender<LinkEvent>,
     counters: Arc<Counters>,
     decoder: FrameDecoder,
-    scheduler: Arc<QueueSchedulerControl>,
     read_buffer: Vec<u8>,
     burst_hub: Option<BurstHub>,
     channel_usable: bool,
-    deferred_service: std::collections::VecDeque<Job>,
-    deferred_normal: std::collections::VecDeque<Job>,
     maximum_coalesced: usize,
     late_response_guard: Duration,
 }
@@ -1384,11 +1268,11 @@ pub struct LinkBuilder<C> {
     config: LinkConfig,
     event_capacity: usize,
     maximum_coalesced: usize,
-    default_priority: Priority,
+    queue_layout: Option<Vec<QueueConfig>>,
+    default_queue: QueueId,
     default_retry: RetryPolicy,
     burst_hub: Option<BurstHub>,
     late_response_guard: Duration,
-    queue_mode: QueueMode,
     command_policy: CommandPolicy,
     command_routing: CommandRouting,
 }
@@ -1396,10 +1280,10 @@ pub struct LinkBuilder<C> {
 struct LinkRuntimeOptions {
     event_capacity: usize,
     maximum_coalesced: usize,
-    default_priority: Priority,
+    queue_layout: Vec<QueueConfig>,
+    default_queue: QueueId,
     default_retry: RetryPolicy,
     late_response_guard: Duration,
-    queue_mode: QueueMode,
     command_policy: CommandPolicy,
     command_routing: CommandRouting,
 }
@@ -1409,10 +1293,13 @@ impl Default for LinkRuntimeOptions {
         Self {
             event_capacity: 512,
             maximum_coalesced: 64,
-            default_priority: Priority::Normal,
+            queue_layout: vec![
+                QueueConfig::weighted(QueueId::DEFAULT, 256, 1)
+                    .expect("the built-in queue layout is valid"),
+            ],
+            default_queue: QueueId::DEFAULT,
             default_retry: RetryPolicy::default(),
             late_response_guard: DEFAULT_LATE_RESPONSE_GUARD,
-            queue_mode: QueueMode::Prioritized,
             command_policy: CommandPolicy::allow_all(),
             command_routing: CommandRouting::preserve_requested(),
         }
@@ -1427,11 +1314,11 @@ impl<C: ByteChannel> LinkBuilder<C> {
             config: LinkConfig::default(),
             event_capacity: 512,
             maximum_coalesced: 64,
-            default_priority: Priority::Normal,
+            queue_layout: None,
+            default_queue: QueueId::DEFAULT,
             default_retry: RetryPolicy::default(),
             burst_hub: None,
             late_response_guard: DEFAULT_LATE_RESPONSE_GUARD,
-            queue_mode: QueueMode::Prioritized,
             command_policy: CommandPolicy::default(),
             command_routing: CommandRouting::default(),
         }
@@ -1443,38 +1330,12 @@ impl<C: ByteChannel> LinkBuilder<C> {
         self
     }
 
-    /// Sets both bounded queue capacities without replacing decoder settings.
-    pub const fn queue_capacities(mut self, service: usize, normal: usize) -> Self {
-        self.config.service_capacity = service;
-        self.config.normal_capacity = normal;
-        self
-    }
-
-    /// Uses one global FIFO queue and ignores caller-supplied priorities.
-    pub const fn single_queue(mut self, capacity: usize) -> Self {
-        self.queue_mode = QueueMode::SingleFifo;
-        self.config.service_capacity = 1;
-        self.config.normal_capacity = capacity;
-        self
-    }
-
-    /// Restores two independently bounded priority queues.
-    pub const fn prioritized_queues(mut self, service: usize, normal: usize) -> Self {
-        self.queue_mode = QueueMode::Prioritized;
-        self.config.service_capacity = service;
-        self.config.normal_capacity = normal;
-        self
-    }
-
-    /// Sets the weighted-fair service quota.
-    pub const fn service_weight(mut self, service_weight: u8) -> Self {
-        self.config.service_weight = service_weight;
-        self
-    }
-
-    /// Applies a validated queue-scheduling preset.
-    pub const fn queue_scheduling(mut self, scheduling: QueueScheduling) -> Self {
-        self.config.service_weight = scheduling.service_weight();
+    /// Replaces the complete queue layout.
+    ///
+    /// Queue order is also the deterministic rotation order for weighted peers. Validation is
+    /// deferred to [`Self::build`] so a layout can be assembled without partial runtime state.
+    pub fn queues(mut self, queues: impl IntoIterator<Item = QueueConfig>) -> Self {
+        self.queue_layout = Some(queues.into_iter().collect());
         self
     }
 
@@ -1502,9 +1363,9 @@ impl<C: ByteChannel> LinkBuilder<C> {
         self
     }
 
-    /// Sets the priority used by the convenience methods on [`LinkClient`].
-    pub const fn default_priority(mut self, default_priority: Priority) -> Self {
-        self.default_priority = default_priority;
+    /// Selects the queue used by convenience methods on [`LinkClient`].
+    pub const fn default_queue(mut self, default_queue: QueueId) -> Self {
+        self.default_queue = default_queue;
         self
     }
 
@@ -1520,7 +1381,7 @@ impl<C: ByteChannel> LinkBuilder<C> {
         self
     }
 
-    /// Applies automatic command-to-priority routing before admission control.
+    /// Applies automatic command-to-queue routing before admission control.
     pub fn command_routing(mut self, command_routing: CommandRouting) -> Self {
         self.command_routing = command_routing;
         self
@@ -1551,13 +1412,20 @@ impl<C: ByteChannel> LinkBuilder<C> {
         if self.late_response_guard > MAXIMUM_LATE_RESPONSE_GUARD {
             return Err(LinkBuildError::LateResponseGuard);
         }
+        let queue_layout = self.queue_layout.unwrap_or_else(|| {
+            vec![
+                QueueConfig::weighted(QueueId::DEFAULT, self.config.queue_capacity, 1)
+                    .expect("LinkConfig validation guarantees the default queue"),
+            ]
+        });
+        validate_layout(&queue_layout, self.default_queue)?;
         let options = LinkRuntimeOptions {
             event_capacity: self.event_capacity,
             maximum_coalesced: self.maximum_coalesced,
-            default_priority: self.default_priority,
+            queue_layout,
+            default_queue: self.default_queue,
             default_retry: self.default_retry,
             late_response_guard: self.late_response_guard,
-            queue_mode: self.queue_mode,
             command_policy: self.command_policy,
             command_routing: self.command_routing,
         };
@@ -1572,26 +1440,21 @@ impl<C: ByteChannel> LinkBuilder<C> {
 /// Invalid capacities are clamped to safe compatibility bounds. New applications that want
 /// invalid configuration reported explicitly should call [`try_create_link`] or [`LinkBuilder`].
 pub fn create_link<C: ByteChannel>(channel: C, config: LinkConfig) -> (LinkClient, LinkRunner<C>) {
-    build_link(
-        channel,
-        LinkConfig {
-            service_capacity: config
-                .service_capacity
-                .clamp(1, MAXIMUM_LINK_QUEUE_CAPACITY),
-            normal_capacity: config.normal_capacity.clamp(1, MAXIMUM_LINK_QUEUE_CAPACITY),
-            service_weight: config.service_weight.max(1),
-            read_buffer_size: config.read_buffer_size.clamp(64, MAXIMUM_LINK_READ_BUFFER),
-            decoder: DecodeLimits {
-                buffer_capacity: config.decoder.buffer_capacity.clamp(
-                    required_decoder_capacity(config.decoder.minimum_preambles.max(1)),
-                    MAXIMUM_LINK_DECODER_BUFFER,
-                ),
-                minimum_preambles: config.decoder.minimum_preambles.max(1),
-                checksum_policy: normalized_checksum_policy(config.decoder.checksum_policy),
-            },
+    let config = LinkConfig {
+        queue_capacity: config
+            .queue_capacity
+            .clamp(1, super::MAXIMUM_QUEUE_CAPACITY),
+        read_buffer_size: config.read_buffer_size.clamp(64, MAXIMUM_LINK_READ_BUFFER),
+        decoder: DecodeLimits {
+            buffer_capacity: config.decoder.buffer_capacity.clamp(
+                required_decoder_capacity(config.decoder.minimum_preambles.max(1)),
+                MAXIMUM_LINK_DECODER_BUFFER,
+            ),
+            minimum_preambles: config.decoder.minimum_preambles.max(1),
+            checksum_policy: normalized_checksum_policy(config.decoder.checksum_policy),
         },
-        LinkRuntimeOptions::default(),
-    )
+    };
+    build_link(channel, config, default_runtime_options(config))
 }
 
 const fn required_decoder_capacity(minimum_preambles: u8) -> usize {
@@ -1617,7 +1480,17 @@ pub fn try_create_link<C: ByteChannel>(
     config: LinkConfig,
 ) -> Result<(LinkClient, LinkRunner<C>), LinkConfigError> {
     config.validate()?;
-    Ok(build_link(channel, config, LinkRuntimeOptions::default()))
+    Ok(build_link(channel, config, default_runtime_options(config)))
+}
+
+fn default_runtime_options(config: LinkConfig) -> LinkRuntimeOptions {
+    LinkRuntimeOptions {
+        queue_layout: vec![
+            QueueConfig::weighted(QueueId::DEFAULT, config.queue_capacity, 1)
+                .expect("validated LinkConfig always creates a valid default queue"),
+        ],
+        ..LinkRuntimeOptions::default()
+    }
 }
 
 fn build_link<C: ByteChannel>(
@@ -1625,36 +1498,31 @@ fn build_link<C: ByteChannel>(
     config: LinkConfig,
     options: LinkRuntimeOptions,
 ) -> (LinkClient, LinkRunner<C>) {
-    let (service_tx, service_rx) = mpsc::channel(config.service_capacity);
-    let (normal_tx, normal_rx) = mpsc::channel(config.normal_capacity);
     let (events, _) = broadcast::channel(options.event_capacity);
     let counters = Arc::new(Counters::default());
-    let scheduler = Arc::new(QueueSchedulerControl::new(config.service_weight));
+    let queues = Arc::new(QueueSet::new(&options.queue_layout));
+    let lifetime = Arc::new(ClientLifetime {
+        queues: Arc::clone(&queues),
+    });
     let client = LinkClient {
-        service_tx,
-        normal_tx,
+        queues: Arc::clone(&queues),
+        _lifetime: lifetime,
         events: events.clone(),
         counters: counters.clone(),
-        default_priority: options.default_priority,
+        default_queue: options.default_queue,
         default_retry: options.default_retry,
-        queue_mode: options.queue_mode,
         command_policy: options.command_policy,
         command_routing: options.command_routing,
-        scheduler: scheduler.clone(),
     };
     let runner = LinkRunner {
         channel,
-        service_rx,
-        normal_rx,
+        queues,
         events,
         counters,
         decoder: FrameDecoder::new(config.decoder),
-        scheduler,
         read_buffer: vec![0; config.read_buffer_size],
         burst_hub: None,
         channel_usable: true,
-        deferred_service: std::collections::VecDeque::new(),
-        deferred_normal: std::collections::VecDeque::new(),
         maximum_coalesced: options.maximum_coalesced,
         late_response_guard: options.late_response_guard,
     };
@@ -1670,9 +1538,9 @@ impl<C: ByteChannel> LinkRunner<C> {
 
     /// Serves the queue until every client is closed.
     pub async fn run(mut self) {
-        let mut consecutive_service = 0_u16;
-        while let Some((priority, mut job)) = self.next_job(&mut consecutive_service).await {
-            self.decrement_queue(priority);
+        let mut cursor = QueueCursor::new();
+        while let Some((queue, entry)) = self.next_job(&mut cursor).await {
+            let mut job = self.queues.finish_entry(queue, entry);
             if job.reply.as_ref().is_none_or(oneshot::Sender::is_closed) {
                 self.mark_cancelled(job.id);
                 continue;
@@ -1686,7 +1554,7 @@ impl<C: ByteChannel> LinkRunner<C> {
                 let _ = reply.send(Err(ExchangeError::Deadline));
                 continue;
             }
-            let followers = self.take_coalescible_followers(priority, &job);
+            let followers = self.take_coalescible_followers(queue, &job);
             self.counters.started.fetch_add(1, Ordering::Relaxed);
             let _ = self.events.send(LinkEvent::Started {
                 id: job.id,
@@ -1700,11 +1568,11 @@ impl<C: ByteChannel> LinkRunner<C> {
                         self.mark_completed(job.id);
                         let _ = reply.send(Ok(value.clone()));
                     }
-                    self.complete_followers(priority, followers, &value);
+                    self.complete_followers(queue, followers, &value);
                 }
                 Err(error) => {
                     let timed_out = matches!(error, ExchangeError::ResponseTimeout);
-                    self.requeue_followers(priority, followers);
+                    self.requeue_followers(queue, followers);
                     if reply.is_closed() {
                         self.mark_cancelled(job.id);
                     } else {
@@ -1723,112 +1591,28 @@ impl<C: ByteChannel> LinkRunner<C> {
         self.fail_pending_jobs();
     }
 
-    async fn next_job(&mut self, consecutive_service: &mut u16) -> Option<(Priority, Job)> {
+    async fn next_job(&mut self, cursor: &mut QueueCursor) -> Option<(QueueId, QueueEntry<Job>)> {
         loop {
-            let service_weight = u16::from(self.scheduler.service_weight());
-            let normal_is_due = *consecutive_service >= service_weight;
-            if normal_is_due && let Some(job) = self.try_take_job(Priority::Normal) {
-                *consecutive_service = 0;
-                return Some((Priority::Normal, job));
+            let notified = self.queues.notified();
+            if let Some(job) = self.queues.pop_scheduled(cursor) {
+                return Some(job);
             }
-            if let Some(job) = self.try_take_job(Priority::Service) {
-                *consecutive_service = consecutive_service.saturating_add(1);
-                return Some((Priority::Service, job));
-            }
-            if let Some(job) = self.try_take_job(Priority::Normal) {
-                *consecutive_service = 0;
-                return Some((Priority::Normal, job));
-            }
-            if self.service_rx.is_closed() && self.normal_rx.is_closed() {
+            if self.queues.input_closed() {
                 return None;
             }
-            if self.service_rx.is_closed() {
-                let selected = tokio::select! {
-                    value = self.normal_rx.recv() => value.map(|job| IdleSelection::Job(Priority::Normal, job)),
-                    value = self.channel.receive(&mut self.read_buffer) => Some(IdleSelection::Input(value)),
-                };
-                match selected {
-                    Some(IdleSelection::Job(priority, job)) => {
-                        *consecutive_service = 0;
-                        return Some((priority, job));
-                    }
-                    Some(IdleSelection::Input(result)) => {
-                        if self.process_idle_input(&result) {
-                            continue;
-                        }
-                        return None;
-                    }
-                    None => return None,
-                }
-            }
-            if self.normal_rx.is_closed() {
-                let selected = tokio::select! {
-                    value = self.service_rx.recv() => value.map(|job| IdleSelection::Job(Priority::Service, job)),
-                    value = self.channel.receive(&mut self.read_buffer) => Some(IdleSelection::Input(value)),
-                };
-                match selected {
-                    Some(IdleSelection::Job(priority, job)) => {
-                        *consecutive_service = consecutive_service.saturating_add(1);
-                        return Some((priority, job));
-                    }
-                    Some(IdleSelection::Input(result)) => {
-                        if self.process_idle_input(&result) {
-                            continue;
-                        }
-                        return None;
-                    }
-                    None => return None,
-                }
-            }
-            let selected = if normal_is_due {
-                tokio::select! {
-                    biased;
-                    value = self.normal_rx.recv() => value.map(|job| IdleSelection::Job(Priority::Normal, job)),
-                    value = self.service_rx.recv() => value.map(|job| IdleSelection::Job(Priority::Service, job)),
-                    value = self.channel.receive(&mut self.read_buffer) => Some(IdleSelection::Input(value)),
-                }
-            } else {
-                tokio::select! {
-                    biased;
-                    value = self.service_rx.recv() => value.map(|job| IdleSelection::Job(Priority::Service, job)),
-                    value = self.normal_rx.recv() => value.map(|job| IdleSelection::Job(Priority::Normal, job)),
-                    value = self.channel.receive(&mut self.read_buffer) => Some(IdleSelection::Input(value)),
-                }
+            let input = tokio::select! {
+                () = notified => None,
+                value = self.channel.receive(&mut self.read_buffer) => Some(value),
             };
-            match selected {
-                Some(IdleSelection::Job(priority, job)) => {
-                    match priority {
-                        Priority::Service => {
-                            *consecutive_service = consecutive_service.saturating_add(1);
-                        }
-                        Priority::Normal => *consecutive_service = 0,
-                    }
-                    return Some((priority, job));
-                }
-                Some(IdleSelection::Input(result)) => {
-                    if !self.process_idle_input(&result) {
-                        return None;
-                    }
-                }
-                None => return None,
+            if let Some(result) = input
+                && !self.process_idle_input(&result)
+            {
+                return None;
             }
         }
     }
 
-    fn try_take_job(&mut self, priority: Priority) -> Option<Job> {
-        match priority {
-            Priority::Service => self
-                .deferred_service
-                .pop_front()
-                .or_else(|| self.service_rx.try_recv().ok()),
-            Priority::Normal => self
-                .deferred_normal
-                .pop_front()
-                .or_else(|| self.normal_rx.try_recv().ok()),
-        }
-    }
-
-    fn take_coalescible_followers(&mut self, priority: Priority, leader: &Job) -> Vec<Job> {
+    fn take_coalescible_followers(&mut self, queue: QueueId, leader: &Job) -> Vec<QueueEntry<Job>> {
         if resolved_safety(&leader.request) != OperationSafety::ReadOnly
             || !leader.transmit_prefix.is_empty()
             || self.maximum_coalesced == 0
@@ -1837,43 +1621,42 @@ impl<C: ByteChannel> LinkRunner<C> {
         }
         let mut followers = Vec::new();
         while followers.len() < self.maximum_coalesced {
-            let candidate = match priority {
-                Priority::Service => self.service_rx.try_recv(),
-                Priority::Normal => self.normal_rx.try_recv(),
-            };
-            let Ok(candidate) = candidate else {
+            let Some(candidate) = self.queues.pop_from(queue) else {
                 break;
             };
-            if requests_can_coalesce(leader, &candidate) {
+            if requests_can_coalesce(leader, candidate.item()) {
                 if candidate
+                    .item()
                     .reply
                     .as_ref()
                     .is_none_or(oneshot::Sender::is_closed)
                 {
-                    self.decrement_queue(priority);
+                    let candidate = self.queues.finish_entry(queue, candidate);
                     self.mark_cancelled(candidate.id);
                 } else {
                     self.counters.coalesced.fetch_add(1, Ordering::Relaxed);
                     let _ = self.events.send(LinkEvent::Coalesced {
-                        id: candidate.id,
+                        id: candidate.item().id,
                         leader_id: leader.id,
                     });
                     followers.push(candidate);
                 }
                 continue;
             }
-            match priority {
-                Priority::Service => self.deferred_service.push_back(candidate),
-                Priority::Normal => self.deferred_normal.push_back(candidate),
-            }
+            self.queues.push_front(queue, candidate);
             break;
         }
         followers
     }
 
-    fn complete_followers(&self, priority: Priority, followers: Vec<Job>, value: &DeviceReply) {
-        for mut follower in followers {
-            self.decrement_queue(priority);
+    fn complete_followers(
+        &self,
+        queue: QueueId,
+        followers: Vec<QueueEntry<Job>>,
+        value: &DeviceReply,
+    ) {
+        for follower in followers {
+            let mut follower = self.queues.finish_entry(queue, follower);
             let Some(reply) = follower.reply.take() else {
                 self.mark_cancelled(follower.id);
                 continue;
@@ -1890,34 +1673,19 @@ impl<C: ByteChannel> LinkRunner<C> {
         }
     }
 
-    fn requeue_followers(&mut self, priority: Priority, followers: Vec<Job>) {
-        let queue = match priority {
-            Priority::Service => &mut self.deferred_service,
-            Priority::Normal => &mut self.deferred_normal,
-        };
+    fn requeue_followers(&mut self, queue: QueueId, followers: Vec<QueueEntry<Job>>) {
         for follower in followers.into_iter().rev() {
-            queue.push_front(follower);
+            self.queues.push_front(queue, follower);
         }
     }
 
     fn fail_pending_jobs(&mut self) {
-        self.service_rx.close();
-        self.normal_rx.close();
-        while let Some(mut job) = self
-            .deferred_service
-            .pop_front()
-            .or_else(|| self.service_rx.try_recv().ok())
-        {
-            self.decrement_queue(Priority::Service);
-            fail_stopped_job(self, &mut job);
-        }
-        while let Some(mut job) = self
-            .deferred_normal
-            .pop_front()
-            .or_else(|| self.normal_rx.try_recv().ok())
-        {
-            self.decrement_queue(Priority::Normal);
-            fail_stopped_job(self, &mut job);
+        self.queues.close_runner();
+        for snapshot in self.queues.snapshots() {
+            while let Some(entry) = self.queues.pop_from(snapshot.id) {
+                let mut job = self.queues.finish_entry(snapshot.id, entry);
+                fail_stopped_job(self, &mut job);
+            }
         }
     }
 
@@ -2147,13 +1915,6 @@ impl<C: ByteChannel> LinkRunner<C> {
         }
     }
 
-    fn decrement_queue(&self, priority: Priority) {
-        match priority {
-            Priority::Service => self.counters.queued_service.fetch_sub(1, Ordering::Relaxed),
-            Priority::Normal => self.counters.queued_normal.fetch_sub(1, Ordering::Relaxed),
-        };
-    }
-
     fn mark_cancelled(&self, id: u64) {
         self.counters.cancelled.fetch_add(1, Ordering::Relaxed);
         let _ = self.events.send(LinkEvent::Cancelled { id });
@@ -2231,6 +1992,7 @@ fn is_retryable_transport_error(error: &ExchangeError) -> bool {
 const fn error_reason(error: &ExchangeError) -> &'static str {
     match error {
         ExchangeError::CommandDenied { .. } => "command policy",
+        ExchangeError::UnknownQueue(_) => "unknown queue",
         ExchangeError::Deadline => "end-to-end deadline",
         ExchangeError::ResponseTimeout => "response timeout",
         ExchangeError::SendTimeout => "send timeout",

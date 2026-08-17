@@ -14,12 +14,8 @@ pub trait MetricSink {
 /// Exports a snapshot with fixed names and no high-cardinality labels.
 pub fn export_link_snapshot(snapshot: LinkSnapshot, sink: &mut impl MetricSink) {
     sink.gauge(
-        "hart_link_queue_service",
-        u64::try_from(snapshot.queued_service).unwrap_or(u64::MAX),
-    );
-    sink.gauge(
-        "hart_link_queue_normal",
-        u64::try_from(snapshot.queued_normal).unwrap_or(u64::MAX),
+        "hart_link_queue_pending",
+        u64::try_from(snapshot.queued).unwrap_or(u64::MAX),
     );
     sink.counter("hart_link_started_total", snapshot.started);
     sink.counter("hart_link_completed_total", snapshot.completed);

@@ -24,6 +24,27 @@
 //! assert_eq!(report.command.get(), 0);
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
+//!
+//! # Application-defined queues
+//!
+//! Runtime users define one or more independently bounded queues. Weighted queues rotate
+//! without starvation; strict queues explicitly precede weighted traffic.
+//!
+//! ```
+//! # #[cfg(feature = "runtime")]
+//! # {
+//! use hart_link::{QueueConfig, QueueId, QueuePriority};
+//!
+//! const CONTROL: QueueId = QueueId::new(10);
+//! const POLLING: QueueId = QueueId::new(20);
+//! let queues = [
+//!     QueueConfig::strict(CONTROL, 32, 10)?,
+//!     QueueConfig::weighted(POLLING, 256, 1)?,
+//! ];
+//! assert_eq!(queues[0].priority(), QueuePriority::strict(10));
+//! # }
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
@@ -100,9 +121,10 @@ pub use service::{
     DeviceHealthConfigError, DeviceHealthOptions, DeviceHealthSnapshot, DeviceSnapshot,
     ExchangeError, LinkBuildError, LinkBuilder, LinkClient, LinkConfig, LinkConfigError, LinkEvent,
     LinkRunner, LinkSnapshot, MAXIMUM_LATE_RESPONSE_GUARD, MAXIMUM_LINK_DECODER_BUFFER,
-    MAXIMUM_LINK_EVENT_CAPACITY, MAXIMUM_LINK_QUEUE_CAPACITY, MAXIMUM_LINK_READ_BUFFER,
-    MAXIMUM_RETRY_DURATION, MAXIMUM_TRANSMIT_PREFIX, ManagedDeviceSession, ManagedSessionError,
-    PendingReply, Priority, PriorityClient, QueueMode, QueueScheduling, QueueSchedulingError,
-    RetryCause, RetryPolicy, RetryPolicyError, SnapshotError, SnapshotField, SnapshotOptions,
-    StartError, create_link, try_create_link,
+    MAXIMUM_LINK_EVENT_CAPACITY, MAXIMUM_LINK_QUEUES, MAXIMUM_LINK_READ_BUFFER,
+    MAXIMUM_QUEUE_CAPACITY, MAXIMUM_RETRY_DURATION, MAXIMUM_TOTAL_QUEUE_CAPACITY,
+    MAXIMUM_TRANSMIT_PREFIX, ManagedDeviceSession, ManagedSessionError, PendingReply, QueueClient,
+    QueueConfig, QueueConfigError, QueueError, QueueId, QueuePriority, QueueSnapshot, RetryCause,
+    RetryPolicy, RetryPolicyError, SnapshotError, SnapshotField, SnapshotOptions, StartError,
+    create_link, try_create_link,
 };

@@ -1,10 +1,11 @@
-//! Command execution through a bounded priority queue.
+//! Command execution through independently bounded, application-defined queues.
 
 mod burst;
 mod discovery;
 mod health;
 mod link;
 mod planner;
+mod queue_set;
 mod recovery;
 mod session;
 mod snapshot;
@@ -28,12 +29,15 @@ pub use link::{
     CommandContext, CommandPolicy, CommandRouting, DEFAULT_LATE_RESPONSE_GUARD, ExchangeError,
     LinkBuildError, LinkBuilder, LinkClient, LinkConfig, LinkConfigError, LinkEvent, LinkRunner,
     LinkSnapshot, MAXIMUM_LATE_RESPONSE_GUARD, MAXIMUM_LINK_DECODER_BUFFER,
-    MAXIMUM_LINK_EVENT_CAPACITY, MAXIMUM_LINK_QUEUE_CAPACITY, MAXIMUM_LINK_READ_BUFFER,
-    MAXIMUM_RETRY_DURATION, MAXIMUM_TRANSMIT_PREFIX, PendingReply, Priority, PriorityClient,
-    QueueMode, QueueScheduling, QueueSchedulingError, RetryCause, RetryPolicy, RetryPolicyError,
+    MAXIMUM_LINK_EVENT_CAPACITY, MAXIMUM_LINK_READ_BUFFER, MAXIMUM_RETRY_DURATION,
+    MAXIMUM_TRANSMIT_PREFIX, PendingReply, QueueClient, RetryCause, RetryPolicy, RetryPolicyError,
     StartError, create_link, try_create_link,
 };
 pub use planner::{Plan, PlanExpectation, PlanReport, PlanStep, StepReport};
+pub use queue_set::{
+    MAXIMUM_LINK_QUEUES, MAXIMUM_QUEUE_CAPACITY, MAXIMUM_TOTAL_QUEUE_CAPACITY, QueueConfig,
+    QueueConfigError, QueueError, QueueId, QueuePriority, QueueSnapshot,
+};
 pub use recovery::{KnownDevice, RecoveryReport, RecoveryStatus, reconcile_devices};
 pub use session::{DeviceSession, SessionError, SessionProfile};
 pub use snapshot::{DeviceSnapshot, SnapshotError, SnapshotField, SnapshotOptions};

@@ -1,7 +1,7 @@
 use crate::{
     Address,
     operation::{DeviceIdentity, ReadDeviceIdentity},
-    service::{ExchangeError, LinkClient, Priority, RetryPolicy},
+    service::{ExchangeError, LinkClient, RetryPolicy},
 };
 
 /// Device whose state should be recovered after reconnecting.
@@ -43,7 +43,7 @@ pub async fn reconcile_devices(
             .execute(
                 previous.address,
                 &ReadDeviceIdentity,
-                Priority::Service,
+                link.default_queue_id(),
                 retry,
             )
             .await

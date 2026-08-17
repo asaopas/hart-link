@@ -1,6 +1,6 @@
 use crate::{
     DeviceReply, Request,
-    service::{ExchangeError, LinkClient, Priority, RetryPolicy},
+    service::{ExchangeError, LinkClient, QueueId, RetryPolicy},
 };
 
 /// Result check for one step.
@@ -21,8 +21,8 @@ pub struct PlanStep {
     pub name: String,
     /// Complete request.
     pub request: Request,
-    /// Queue priority.
-    pub priority: Priority,
+    /// Queue used for this step.
+    pub queue: QueueId,
     /// Retry and timing limits.
     pub retry: RetryPolicy,
     /// Expected result.
@@ -30,20 +30,20 @@ pub struct PlanStep {
 }
 
 impl PlanStep {
-    /// Creates a normal-priority success step with default retry settings.
+    /// Creates a success step in the default queue with default retry settings.
     pub fn new(name: impl Into<String>, request: Request) -> Self {
         Self {
             name: name.into(),
             request,
-            priority: Priority::Normal,
+            queue: QueueId::DEFAULT,
             retry: RetryPolicy::default(),
             expectation: PlanExpectation::Success,
         }
     }
 
-    /// Sets the queue priority.
-    pub const fn with_priority(mut self, priority: Priority) -> Self {
-        self.priority = priority;
+    /// Sets the queue used by this step.
+    pub const fn with_queue(mut self, queue: QueueId) -> Self {
+        self.queue = queue;
         self
     }
 
@@ -113,7 +113,7 @@ impl Plan {
         let mut report = PlanReport::default();
         for step in &self.steps {
             let result = link
-                .request(step.request.clone(), step.priority, step.retry)
+                .request(step.request.clone(), step.queue, step.retry)
                 .await;
             let expectation_met = result
                 .as_ref()
