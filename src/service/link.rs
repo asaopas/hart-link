@@ -1692,6 +1692,7 @@ impl<C: ByteChannel> LinkRunner<C> {
     fn process_idle_input(&mut self, result: &Result<usize, ChannelError>) -> bool {
         let read = match result {
             Ok(read) if *read > 0 && *read <= self.read_buffer.len() => *read,
+            Err(error) if is_receive_timeout(error) => return true,
             Ok(0) | Err(ChannelError::Closed) => {
                 let _ = self.events.send(LinkEvent::ChannelStopped {
                     reason: "channel closed",
@@ -1855,6 +1856,9 @@ impl<C: ByteChannel> LinkRunner<C> {
             let read = match timeout_at(deadline, self.channel.receive(&mut self.read_buffer)).await
             {
                 Ok(Ok(read)) => read,
+                Ok(Err(error)) if is_receive_timeout(&error) => {
+                    return Err(ExchangeError::ResponseTimeout);
+                }
                 Ok(Err(error)) => {
                     self.channel_usable = false;
                     return Err(error.into());
@@ -1987,6 +1991,11 @@ async fn wait_before_retry(delay: Duration, deadline: Instant) -> Result<(), Exc
 
 fn is_retryable_transport_error(error: &ExchangeError) -> bool {
     matches!(error, ExchangeError::ResponseTimeout)
+}
+
+fn is_receive_timeout(error: &ChannelError) -> bool {
+    matches!(error, ChannelError::Timeout(_))
+        || matches!(error, ChannelError::Io(error) if error.kind() == std::io::ErrorKind::TimedOut)
 }
 
 const fn error_reason(error: &ExchangeError) -> &'static str {

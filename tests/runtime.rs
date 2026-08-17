@@ -186,6 +186,86 @@ impl hart_link::channel::ByteChannel for SilentChannel {
 }
 
 #[derive(Debug)]
+struct ReceiveTimeoutOnceChannel {
+    address: Address,
+    sends: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    timeout_pending: bool,
+    response: std::collections::VecDeque<u8>,
+}
+
+impl ReceiveTimeoutOnceChannel {
+    fn new(address: Address) -> (Self, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let sends = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        (
+            Self {
+                address,
+                sends: sends.clone(),
+                timeout_pending: true,
+                response: std::collections::VecDeque::new(),
+            },
+            sends,
+        )
+    }
+}
+
+impl hart_link::channel::ByteChannel for ReceiveTimeoutOnceChannel {
+    fn send<'a>(&'a mut self, _bytes: &'a [u8]) -> hart_link::channel::ChannelFuture<'a, ()> {
+        Box::pin(async move {
+            let attempt = self
+                .sends
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            if attempt >= 2 {
+                let mut payload = vec![0, 0, 57];
+                payload.extend_from_slice(&123.5f32.to_be_bytes());
+                self.response.extend(
+                    Frame {
+                        preambles: 5,
+                        kind: FrameKind::Response,
+                        physical_layer: PhysicalLayer::Fsk,
+                        address: self.address,
+                        expansion: Vec::new(),
+                        wire_command: 1,
+                        payload,
+                        repair: None,
+                    }
+                    .encode()
+                    .unwrap(),
+                );
+            }
+            Ok(())
+        })
+    }
+
+    fn receive<'a>(
+        &'a mut self,
+        buffer: &'a mut [u8],
+    ) -> hart_link::channel::ChannelFuture<'a, usize> {
+        Box::pin(async move {
+            if self.timeout_pending {
+                self.timeout_pending = false;
+                return Err(hart_link::channel::ChannelError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "synthetic receive timeout",
+                )));
+            }
+            if self.response.is_empty() {
+                return std::future::pending().await;
+            }
+            let count = buffer.len().min(self.response.len());
+            for destination in &mut buffer[..count] {
+                *destination = self.response.pop_front().unwrap_or_default();
+            }
+            Ok(count)
+        })
+    }
+
+    fn flush(&mut self) -> hart_link::channel::ChannelFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+#[derive(Debug)]
 struct GatedSchedulerChannel {
     address: Address,
     pending: std::collections::VecDeque<u8>,
@@ -772,6 +852,30 @@ async fn request_rejects_an_oversized_frame_before_enqueueing() {
         hart_link::service::StartError::Operation(_)
     ));
     assert_eq!(client.snapshot().queued, 0);
+}
+
+#[tokio::test]
+async fn receive_timeout_uses_the_retry_budget_without_stopping_the_runner() {
+    let address = Address::polling(1, Master::Primary).unwrap();
+    let (channel, sends) = ReceiveTimeoutOnceChannel::new(address);
+    let (client, runner) = hart_link::create_link(channel, hart_link::LinkConfig::default());
+    let runner_task = tokio::spawn(runner.run());
+    let reply = client
+        .execute(
+            address,
+            &ReadPrimaryValue,
+            QueueId::DEFAULT,
+            RetryPolicy::default()
+                .with_transport_retries(1)
+                .with_response_timeout(Duration::from_millis(50))
+                .with_total_timeout(Duration::from_millis(200)),
+        )
+        .await
+        .unwrap();
+    assert!((reply.value - 123.5).abs() < f32::EPSILON);
+    assert_eq!(sends.load(std::sync::atomic::Ordering::Relaxed), 2);
+    drop(client);
+    runner_task.await.unwrap();
 }
 
 #[tokio::test]

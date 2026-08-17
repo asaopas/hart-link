@@ -47,6 +47,9 @@ pub enum ChannelError {
 ///
 /// `receive` must be cancellation-safe: dropping its future before completion must not consume
 /// bytes or corrupt framing. The runner may cancel an idle read when queued work becomes ready.
+/// [`ChannelError::Timeout`] and [`std::io::ErrorKind::TimedOut`] returned by `receive` are treated
+/// as a missing response, so a read-only request may use its configured transport retry budget.
+/// Other receive errors stop the runner because the byte-stream state is no longer known.
 /// A cancelled or timed-out `send` is treated as indeterminate and the runner permanently stops
 /// using that channel, so custom implementations do not need to recover a partial write.
 pub trait ByteChannel: Send {
